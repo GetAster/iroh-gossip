@@ -1,3 +1,23 @@
+# iroh-gossip (aster-rpc fork)
+
+This fork tracks [upstream iroh-gossip](https://github.com/n0-computer/iroh-gossip) and contributes security fixes back. Fixes focus on input validation, panic safety, and denial-of-service surface reduction in the gossip protocol.
+
+## Contributions
+
+| PR | Area | Summary | Upstream |
+|----|------|---------|----------|
+| [#1](https://github.com/aster-rpc/iroh-gossip/pull/1) | Security | Replace panicking expects with graceful error handling in actor loop | Pending |
+| [#2](https://github.com/aster-rpc/iroh-gossip/pull/2) | Security | Recover from RwLock poisoning instead of panicking | Pending |
+| [#3](https://github.com/aster-rpc/iroh-gossip/pull/3) | Security | Add bounds to plumtree data structures to prevent memory exhaustion | Pending |
+| [#4](https://github.com/aster-rpc/iroh-gossip/pull/4) | Security | Use consistent message size comparison on read and write paths | Pending |
+| [#5](https://github.com/aster-rpc/iroh-gossip/pull/5) | Security | Cap per-peer extra connections to prevent unbounded accumulation | Pending |
+
+---
+
+*Below is the original upstream README.*
+
+---
+
 # iroh-gossip
 
 This crate implements the `iroh-gossip` protocol.
