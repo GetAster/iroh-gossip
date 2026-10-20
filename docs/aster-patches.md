@@ -6,7 +6,7 @@ This repository is Aster's fork of [n0-computer/iroh-gossip](https://github.com/
 
 - `main` is upstream `main` plus one commit: the Aster README preamble and this ledger. Nothing is built from `main`. It is refreshed with `git merge upstream/main` and is never reset or force-pushed. Ledger edits are commits on `main`, never on `upgrade/*`.
 - `upgrade/<repo>-v<upstream version>` (for example `upgrade/iroh-v1.4.0`, `upgrade/iroh-blobs-v0.103.1`) is the patched integration line: the upstream release plus the patches in this ledger. A new upstream base always gets a new branch, cut from the upstream release tag; Aster-only fixes and re-pins append to the current branch. Per-minor names (`upgrade/iroh-blobs-v0.103`, `upgrade/salvo-v1.0`, …) are historical. Consumers pin commits on it. Published `upgrade/*` branches and tags are never rewritten; a failed attempt is superseded by new commits and a new version.
-- Topic branches carry one change each, are named for the change (for example `feat/read-into`, `security/plumtree-bounds`), are based on the upstream release tag, and are cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source.
+- Topic branches carry one change each, are named for the change (for example `feat/read-into`, `security/plumtree-bounds`), are based on the upstream release tag (or, for a patch that builds on another, on that prerequisite patch's commit, which its row names), and are cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source. A topic branch a row names is not rewritten; re-cutting it onto a new upstream base takes a versioned name, `<topic>-v<upstream version>`.
 - Version: the upstream version if Aster's registry has never served that version or a higher one in the series; otherwise the next patch above Aster's highest published version. A re-pin without a code change keeps the version and takes the tag suffix `-p<n>`.
 - Tags: `aster-<repo>-v<published version>` (re-pins `aster-<repo>-v<published version>-p<n>`), created only after the Aster consumer trial passes against those exact commits, because tags cannot be moved.
 - The fork manifest is `iroh-fork-manifest.toml` in the Aster repository (the only copy).
@@ -15,7 +15,7 @@ This repository is Aster's fork of [n0-computer/iroh-gossip](https://github.com/
 Historical and current tag schemes in this repository:
 
 - `aster-iroh-gossip-v<version>`, for example `aster-iroh-gossip-v0.99.0`, `aster-iroh-gossip-v0.100.0`, `aster-iroh-gossip-v0.101.1`.
-- `aster-iroh-gossip-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-gossip-v0.101.0-p1`, `-v0.101.0-p2`, and `-v0.101.1-p1` (a patch-block re-pin with no source change).
+- `aster-iroh-gossip-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-gossip-v0.101.0-p1`, `-v0.101.0-p2`, `-v0.101.1-p1` and `-v0.101.1-p2` (patch-block re-pins with no source change).
 
 ## Current release
 
@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-gossip-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-gossip-v<upstream version>`) |
-| Tag | `aster-iroh-gossip-v0.101.1-p1` |
-| Pinned commit | `c0e4a1f2a05ed721122f9289eb27ad8330a9182f` |
+| Tag | `aster-iroh-gossip-v0.101.1-p2` |
+| Pinned commit | `5fde770e167767eadfd208193cb2bf667096e6a7` |
 | Crate version | 0.101.1 (workspace spec `iroh-gossip = "0.101.1"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-gossip.git` |
 
-The fork's own `[patch.crates-io]` (row 17) pins iroh `a4a9a76b` (1.3.2) and noq `e75f3a55` (1.3.2), the stack Aster links it against. The crate code is 0.101.1 (`aed725d1`, row 29); `-p1` changes only the patch block and lock.
+The fork's own `[patch.crates-io]` (row 17) pins iroh `261ad623` (1.4.0) and noq `535bd884` (1.4.0), the stack Aster links it against. The crate code is 0.101.1 (`aed725d1`, row 29); `-p1` and `-p2` change only the patch block and lock.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "c0e4a1f2a05ed721122f9289eb27ad8330a9182f" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "5fde770e167767eadfd208193cb2bf667096e6a7" }
 ```
 
 ## Patches
@@ -42,7 +42,7 @@ Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, 
 
 | Id | Topic branch | What | Why / what in Aster depends on it | Commits (topic / upgrade) | Status | Conflict or porting notes |
 |---|---|---|---|---|---|---|
-| 17 | none recorded (original commit `14a76d5`) | `[patch.crates-io]` block pointing the iroh/noq crates at the Aster forks. File: `Cargo.toml`. | Keeps gossip builds on the Aster fork stack and avoids mixing crates.io iroh-base/noq with forked iroh. | `14a76d5` (original); rc.1 copy `511613f`; re-pinned since, latest in `c0e4a1f2` (0.101.1-p1) | carried | Low conflict risk. Pin explicit fork revs or tags, and re-check comments and direct dependency versions after each upstream release. In the 1.0 port it hit a trailing-EOF conflict in `Cargo.toml`. |
+| 17 | none recorded (original commit `14a76d5`) | `[patch.crates-io]` block pointing the iroh/noq crates at the Aster forks. File: `Cargo.toml`. | Keeps gossip builds on the Aster fork stack and avoids mixing crates.io iroh-base/noq with forked iroh. | `14a76d5` (original); rc.1 copy `511613f`; re-pinned since, latest in `5fde770e` (0.101.1-p2) | carried | Low conflict risk. Pin explicit fork revs or tags, and re-check comments and direct dependency versions after each upstream release. In the 1.0 port it hit a trailing-EOF conflict in `Cargo.toml`. |
 | 29 | `fix/upstream-lifecycle-port` (based on `de100e9`, the 0.101.0-p2 pin, not on the upstream tag) | Ports upstream's unreleased connection and peer lifecycle fixes (upstream `main`, 2026-10-09..14; latest release then v0.101.0). **#161** (fixes #172 and #174): prunes `peer_topics` on disconnect, keeps a peer while another topic still uses it, clears HyParView peer data, answers a `Join` from a peer that is already a neighbour (restart with the same id), and raises the neighbour-request timeout from 500 ms to 3 s. **#178** (fixes #145, #101, #155): a failed dial or a closed connection drops the net actor's peer state, so the next `Join` dials again; unused connections close 5 s after no topic uses them; a write error drops only its stream; a repeated `Gossip::shutdown` returns `Ok`. **#189**: a flags byte after the topic in the stream header; only peers that set it get the close timer, and 0.90–0.101 nodes ignore the trailing byte. **#183**: a cancelled task at runtime shutdown stops the actor without a panic. **#191**: maintenance every 5 s refills below half the active view and rejoins through the last 8 contacts when alone; refill at once after a failed request dial; first shuffle about 1 s after a join; frames from non-neighbours no longer change peer sets; re-exports `Ttl` and `Round`. Files: `Cargo.toml`, `src/net.rs`, `src/net/util.rs`, `src/proto.rs`, `src/proto/{hyparview,plumtree,sim,state,topic}.rs`, `tests/e2e.rs`, `tests/paper.rs`. | The 2026-10-15 Aster restart probe (Aster repository, `docs/_internal/investigations/2026-10-15-restart-reconnect.md`, cause 4): gossip never re-dialled a peer after one failed dial, for every topic including Docs live sync. #178 fixes that. Recovery after a peer restart is still bound by iroh's stale connection (causes 1–2, handled in the iroh and noq forks): the dead connection stays `Active` until the 30 s QUIC idle timeout. | upstream `b89fa98` (#183), `fcd81ae` (#161), `f02f79e` (#178), `cd73d93` (#189), `dfeec14` (#191), cherry-picked `-x` as `b0bbb05`, `e372f13`, `26792b9`, `4099a1b`, `2ce6e82` / the same commits on `upgrade/iroh-gossip-v0.101`; released as 0.101.1 at `aed725d1` | carried | Clean apart from `Cargo.lock` on #183 (upstream's syn/yoke-derive bump; the fork's lock kept). Source equals upstream `main` (`6cbbafa`) except `src/bin/sim.rs` (upstream `f128b98`, clippy-only, not carried). Behaviour changes upstream wants as semver-major: unused connections close after 5 s, and shuffles start about 1 s after a join. Downstream effect: a node whose first gossip dial was refused now joins the swarm once admitted, so HyParView `ForwardJoin` meshes it with the other members (seen in Aster `enrollment_replica_trust`). Upstream known bugs still open: a former instance's `Disconnect` removes its same-id replacement (`known_bug_former_instance_leaving_preserves_replacement`), and #47 (a slow peer blocks the actor). Tests: lib 88, e2e 26, paper 25, sim 4, doc 1; `--no-default-features` lib 54; clippy `--all-features --all-targets -D warnings` and fmt clean. **Drop when a released iroh-gossip containing upstream #161, #172 (fixed by #161), #178, #183, #189 and #191 is pinned.** |
 
 Bookkeeping and documentation commits (not needed at runtime):
@@ -71,7 +71,7 @@ These topic branches came from an April 2026 security review. The fixes from tha
 
 ## Porting to a new upstream release
 
-Order across the iroh family: noq, then iroh, then iroh-blobs, then iroh-docs and this repository. This fork's `[patch.crates-io]` names iroh and noq by revision, so re-pin it after those move (dependency order noq → iroh → iroh-blobs → iroh-docs / iroh-gossip).
+Order across the iroh family: noq, then iroh, then the satellites in the Aster publisher's order: iroh-util, this repository, iroh-blobs, iroh-docs. This fork's `[patch.crates-io]` names iroh and noq by revision, so re-pin it after those move; iroh-docs pins this fork, so it comes after.
 
 Before touching branches, read the upstream changelog and range from the previous base (the rc.1 port reviewed `v0.99.0..v0.100.0`). If the target release contains upstream #161, #178, #183, #189 and #191, drop row 29.
 
@@ -104,7 +104,7 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 
 Whenever iroh-gossip moves, re-pin the iroh-docs fork's own `[patch.crates-io]` to it and run that fork's full suite (`cargo test --all-features`, 118 tests including `tests/sync.rs`): iroh-docs exercises the whole stack.
 
-Gotcha when re-pinning this fork's patch block: `cargo update -p iroh ...` kept crates.io iroh 1.0.2 and reported the patches unused; `cargo update -p iroh --precise 1.3.2` moved it.
+Gotcha when re-pinning this fork's patch block: `cargo update -p iroh ...` kept crates.io iroh 1.0.2 and reported the patches unused; `cargo update -p iroh --precise 1.3.2` moved it. When the lock holds two iroh entries (crates.io and the fork), name the old one: `cargo update -p iroh@<old> --precise <new>`. Update only the crates you name (`cargo update -p`), and revert any unrelated lock churn.
 
 Aster validation after updating pins, from the Aster repository root:
 
@@ -131,7 +131,16 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### 1.3.0 wave (2026-10-03 onward), current
+### 1.4.0 wave (2026-10-21), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-gossip-v0.101.1-p2` | `5fde770e167767eadfd208193cb2bf667096e6a7` | `upgrade/iroh-gossip-v0.101` |
+
+- No upstream iroh-gossip release after `v0.101.0`, so no port; row 29 stays a backport.
+- **2026-10-21, 0.101.1-p2** (`5fde770e`, tag `aster-iroh-gossip-v0.101.1-p2`): re-pin only (row 17). iroh, iroh-base and iroh-relay `a4a9a76b` → `261ad623` (1.4.0, `upgrade/iroh-v1.4.0`); noq, noq-udp and noq-proto `e75f3a55` → `535bd884` (1.4.0, `upgrade/noq-v1.4.0`); the lock follows (rustls 0.23.46, lru 0.18.5). The commit touches only Cargo.toml's `[patch.crates-io]` and Cargo.lock. No source change; the crate stays 0.101.1 and is not republished. Validation: `cargo test --locked --all-features` lib 88, e2e 26, paper 25, sim 4, doc 1 (144 in all); clippy `--all-features --all-targets` and `--no-default-features` `-D warnings`; fmt clean.
+
+### 1.3.0 wave (2026-10-03 onward)
 
 No upstream iroh-gossip release forced a re-port; base stays `v0.101.0`.
 
