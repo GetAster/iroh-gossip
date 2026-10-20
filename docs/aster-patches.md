@@ -55,9 +55,9 @@ Bookkeeping and documentation commits (not needed at runtime):
 
 No iroh-gossip patch has been dropped. Row 29 is itself a backport of upstream work that is merged on upstream `main` but unreleased; it becomes `upstreamed` once a release containing it is pinned.
 
-### Branches not yet triaged
+### Closed security-review branches
 
-These topic branches exist in this repository (April 2026, from an earlier security review) but are not on the current upgrade branch and have no row above. Whether each is still needed, was fixed upstream, or should be dropped has not been decided yet.
+These topic branches came from an April 2026 security review. The fixes from that review that held up were merged upstream, so these branches are not carried on the upgrade branch. They are kept for reference.
 
 | Branch |
 |---|
