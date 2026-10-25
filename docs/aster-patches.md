@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-gossip-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-gossip-v<upstream version>`) |
-| Tag | `aster-iroh-gossip-v0.101.1-p4` |
-| Pinned commit | `0de881834dc91e748bad8028c9f8bd9fd28c26b8` |
+| Tag | `aster-iroh-gossip-v0.101.1-p5` |
+| Pinned commit | `aebdf0231670b803c3af65ce6c67d3439a02a275` |
 | Crate version | 0.101.1 (workspace spec `iroh-gossip = "0.101.1"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-gossip.git` |
 
-The fork's own `[patch.crates-io]` (row 17) pins iroh `91a92aa0` (1.4.0-p2) and noq `a3c70b7a` (1.4.2), the stack Aster links it against. The crate code is 0.101.1 (`aed725d1`, row 29); `-p1` to `-p4` change only the patch block and lock.
+The fork's own `[patch.crates-io]` (row 17) pins iroh `68b684ea` (1.4.1) and noq `a3c70b7a` (1.4.2), the stack Aster links it against. The crate code is 0.101.1 (`aed725d1`, row 29); `-p1` to `-p5` change only the patch block and lock.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "0de881834dc91e748bad8028c9f8bd9fd28c26b8" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aebdf0231670b803c3af65ce6c67d3439a02a275" }
 ```
 
 ## Patches
@@ -131,7 +131,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### noq 1.4.1 and 1.4.2 re-pins (2026-10-22), current
+### iroh 1.4.1 re-pin (2026-10-25), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-gossip-v0.101.1-p5` | `aebdf0231670b803c3af65ce6c67d3439a02a275` | `upgrade/iroh-gossip-v0.101` |
+
+- **`aster-iroh-gossip-v0.101.1-p5`** (`aebdf023`): re-pin only, to iroh `68b684ea` (`aster-iroh-v1.4.1`: the port onto upstream 1.4.1 and row 44, the net report no longer waiting 3 s on an IPv6 path that drops UDP). Only Cargo.toml's `[patch.crates-io]` and Cargo.lock change; the crate is not republished. Validation: `cargo test --locked --all-features`, lib 88, integration and doc tests 26 + 25 + 4 + 1, all passed.
+
+### noq 1.4.1 and 1.4.2 re-pins (2026-10-22)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
