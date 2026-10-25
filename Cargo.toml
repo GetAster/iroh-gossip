@@ -181,9 +181,9 @@ debug = true
 
 # Pin to Aster 1.0 forks. The fork main branches mirror upstream main.
 [patch.crates-io]
-iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "68b684ea3605fb48a4e09d026b51e1673a83d18d" }
-iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "68b684ea3605fb48a4e09d026b51e1673a83d18d" }
-iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "68b684ea3605fb48a4e09d026b51e1673a83d18d" }
+iroh = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "0739c259754353a455745273d4f7673e6d45570c" }
+iroh-base = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "0739c259754353a455745273d4f7673e6d45570c" }
+iroh-relay = { git = "https://forge.emrul.dev/Aster/iroh.git", rev = "0739c259754353a455745273d4f7673e6d45570c" }
 noq = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "a3c70b7afe459cbf01122928f4f90d72063ab972" }
 noq-udp = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "a3c70b7afe459cbf01122928f4f90d72063ab972" }
 noq-proto = { git = "https://forge.emrul.dev/Aster/noq.git", rev = "a3c70b7afe459cbf01122928f4f90d72063ab972" }
