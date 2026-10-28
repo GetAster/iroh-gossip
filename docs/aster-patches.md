@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-gossip-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-gossip-v<upstream version>`) |
-| Tag | `aster-iroh-gossip-v0.101.1-p6` |
-| Pinned commit | `19b4bfbf0fd12c5a44e3d2ddc222b25617faa38d` |
+| Tag | `aster-iroh-gossip-v0.101.1-p7` |
+| Pinned commit | `3fb846f18471ca982c075745f3fa89bacb63b3c0` |
 | Crate version | 0.101.1 (workspace spec `iroh-gossip = "0.101.1"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-gossip.git` |
 
-The fork's own `[patch.crates-io]` (row 17) pins iroh `0739c259` (1.4.2001) and noq `a3c70b7a` (1.4.2), the stack Aster links it against. The crate code is 0.101.1 (`aed725d1`, row 29); `-p1` to `-p6` change only the patch block and lock.
+The fork's own `[patch.crates-io]` (row 17) pins iroh `34ad5b11` (1.4.2002) and noq `de89867c` (1.4.3), the stack Aster links it against. The crate code is 0.101.1 (`aed725d1`, row 29); `-p1` to `-p7` change only the patch block and lock.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "19b4bfbf0fd12c5a44e3d2ddc222b25617faa38d" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "3fb846f18471ca982c075745f3fa89bacb63b3c0" }
 ```
 
 ## Patches
@@ -131,7 +131,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### iroh 1.4.2001 re-pin (2026-10-25), current
+### iroh 1.4.2002 and noq 1.4.3 re-pin (2026-10-28), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.101.0` | `aster-iroh-gossip-v0.101.1-p7` | `3fb846f18471ca982c075745f3fa89bacb63b3c0` | `upgrade/iroh-gossip-v0.101` |
+
+- **`aster-iroh-gossip-v0.101.1-p7`** (`3fb846f1`): re-pin only, to iroh `34ad5b11` (Aster iroh 1.4.2002) and noq `de89867c` (Aster noq 1.4.3). Only Cargo.toml's `[patch.crates-io]` and Cargo.lock change (iroh, iroh-base, iroh-dns, iroh-relay to 1.4.2002; noq, noq-proto, noq-udp to 1.4.3); the crate is not republished. Validation: `cargo test --locked --all-features`, 144 passed, 0 failed; clippy `-D warnings` clean with `--all-features` and with `--no-default-features`. The tag is created after the Aster candidate passes.
+
+### iroh 1.4.2001 re-pin (2026-10-25)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
