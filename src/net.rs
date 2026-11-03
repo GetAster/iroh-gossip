@@ -362,7 +362,7 @@ impl Actor {
     }
 
     pub async fn run(mut self) {
-        let mut addr_update_stream = self.setup().await;
+        let mut addr_update_stream = self.setup();
 
         let mut i = 0;
         while self.event_loop(&mut addr_update_stream, i).await {
@@ -374,10 +374,10 @@ impl Actor {
     ///
     /// This updates our current address and return it. It also returns the home relay stream and
     /// direct addr stream.
-    async fn setup(&mut self) -> impl Stream<Item = EndpointAddr> + Send + Unpin + use<> {
+    fn setup(&mut self) -> impl Stream<Item = EndpointAddr> + Send + Unpin + use<> {
         let addr_update_stream = self.endpoint.watch_addr().stream();
         let initial_addr = self.endpoint.addr();
-        self.handle_addr_update(initial_addr).await;
+        self.handle_addr_update(initial_addr);
         addr_update_stream
     }
 
@@ -397,7 +397,7 @@ impl Actor {
                     Some(LocalActorMessage::Shutdown { reply }) => {
                         debug!("received shutdown message, quit all topics");
                         self.quit_queue.extend(self.topics.keys().copied());
-                        self.process_quit_queue().await;
+                        self.process_quit_queue();
                         debug!("all topics quit, stop gossip actor");
                         reply.send(()).ok();
                         return false;
@@ -426,12 +426,12 @@ impl Actor {
             },
             Some((key, (topic, command))) = self.command_rx.next(), if !self.command_rx.is_empty() => {
                 trace!(?i, "tick: command_rx");
-                self.handle_command(topic, key, command).await;
+                self.handle_command(topic, key, command);
             },
             Some(new_address) = addr_updates.next() => {
                 trace!(?i, "tick: new_address");
                 self.metrics.actor_tick_endpoint.inc();
-                self.handle_addr_update(new_address).await;
+                self.handle_addr_update(new_address);
             }
             (peer_id, res) = self.dialer.next_conn() => {
                 trace!(?i, "tick: dialer");
@@ -448,8 +448,7 @@ impl Actor {
                         let peer_state = self.peers.get(&peer_id);
                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
                         if !is_active {
-                            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                                .await;
+                            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
                         }
                     }
                     None => {
@@ -462,14 +461,14 @@ impl Actor {
                 trace!(?i, "tick: in_event_rx");
                 self.metrics.actor_tick_in_event_rx.inc();
                 let event = event.expect("unreachable: in_event_tx is never dropped before receiver");
-                self.handle_in_event(event, Instant::now()).await;
+                self.handle_in_event(event, Instant::now());
             }
             _ = self.timers.wait_next() => {
                 trace!(?i, "tick: timers");
                 self.metrics.actor_tick_timers.inc();
                 let now = Instant::now();
                 while let Some((_instant, timer)) = self.timers.pop_before(now) {
-                    self.handle_in_event(InEvent::TimerExpired(timer), now).await;
+                    self.handle_in_event(InEvent::TimerExpired(timer), now);
                 }
             }
             Some(res) = self.connection_tasks.join_next(), if !self.connection_tasks.is_empty() => {
@@ -488,7 +487,7 @@ impl Actor {
                 if let Some(state) = self.topics.get_mut(&topic_id) {
                     if !state.still_needed() {
                         self.quit_queue.push_back(topic_id);
-                        self.process_quit_queue().await;
+                        self.process_quit_queue();
                     }
                 }
             }
@@ -497,19 +496,13 @@ impl Actor {
         true
     }
 
-    async fn handle_addr_update(&mut self, endpoint_addr: EndpointAddr) {
+    fn handle_addr_update(&mut self, endpoint_addr: EndpointAddr) {
         // let peer_data = our_peer_data(&self.endpoint, current_addresses);
         let peer_data = encode_peer_data(&endpoint_addr.into());
         self.handle_in_event(InEvent::UpdatePeerData(peer_data), Instant::now())
-            .await
     }
 
-    async fn handle_command(
-        &mut self,
-        topic: TopicId,
-        key: stream_group::Key,
-        command: Option<Command>,
-    ) {
+    fn handle_command(&mut self, topic: TopicId, key: stream_group::Key, command: Option<Command>) {
         debug!(?topic, ?key, ?command, "handle command");
         let Some(state) = self.topics.get_mut(&topic) else {
             // TODO: unreachable?
@@ -525,14 +518,13 @@ impl Actor {
                     }
                     Command::JoinPeers(peers) => ProtoCommand::Join(peers),
                 };
-                self.handle_in_event(proto::InEvent::Command(topic, command), Instant::now())
-                    .await;
+                self.handle_in_event(proto::InEvent::Command(topic, command), Instant::now());
             }
             None => {
                 state.command_rx_keys.remove(&key);
                 if !state.still_needed() {
                     self.quit_queue.push_back(topic);
-                    self.process_quit_queue().await;
+                    self.process_quit_queue();
                 }
             }
         }
@@ -629,8 +621,7 @@ impl Actor {
         {
             if conn.stable_id() == *active_conn_id {
                 debug!("active send connection closed, mark peer as disconnected");
-                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                    .await;
+                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
             } else {
                 other_conns.retain(|x| *x != conn.stable_id());
                 debug!("remaining {} other connections", other_conns.len() + 1);
@@ -689,31 +680,29 @@ impl Actor {
                         ProtoCommand::Join(bootstrap.into_iter().collect()),
                     ),
                     now,
-                )
-                .await;
+                );
             }
         }
     }
 
-    async fn handle_in_event(&mut self, event: InEvent, now: Instant) {
-        self.handle_in_event_inner(event, now).await;
-        self.process_quit_queue().await;
+    fn handle_in_event(&mut self, event: InEvent, now: Instant) {
+        self.handle_in_event_inner(event, now);
+        self.process_quit_queue();
     }
 
-    async fn process_quit_queue(&mut self) {
+    fn process_quit_queue(&mut self) {
         while let Some(topic_id) = self.quit_queue.pop_front() {
             self.handle_in_event_inner(
                 InEvent::Command(topic_id, ProtoCommand::Quit),
                 Instant::now(),
-            )
-            .await;
+            );
             if self.topics.remove(&topic_id).is_some() {
                 tracing::debug!(%topic_id, "publishers and subscribers gone; unsubscribing");
             }
         }
     }
 
-    async fn handle_in_event_inner(&mut self, event: InEvent, now: Instant) {
+    fn handle_in_event_inner(&mut self, event: InEvent, now: Instant) {
         // Drop the state first, so that a message the event causes dials anew.
         if let InEvent::PeerDisconnected(peer) = &event {
             self.peers.remove(peer);
@@ -1316,7 +1305,7 @@ pub(crate) mod tests {
     impl ManualActorLoop {
         #[instrument(skip_all, fields(me = %actor.endpoint.id().fmt_short()))]
         async fn new(mut actor: Actor) -> Self {
-            let _ = actor.setup().await;
+            let _ = actor.setup();
             Self { actor, step: 0 }
         }
 
@@ -2003,9 +1992,7 @@ pub(crate) mod tests {
         );
         disconnect_peer(&mut actor.peers, peer);
         // A failed dial of a peer that is not active reports it gone.
-        actor
-            .handle_in_event(InEvent::PeerDisconnected(peer), Instant::now())
-            .await;
+        actor.handle_in_event(InEvent::PeerDisconnected(peer), Instant::now());
         assert!(!actor.peers.contains_key(&peer));
         Ok(())
     }
@@ -2715,12 +2702,10 @@ pub(crate) mod tests {
             .add(memory_lookup.clone());
         let ep1_addr = EndpointAddr::new(actor.endpoint.id()).with_relay_url(relay_url.clone());
         let topic: TopicId = blake3::hash(b"shuffle_reply_closes").into();
-        actor
-            .handle_in_event(
-                InEvent::Command(topic, proto::Command::Join(vec![])),
-                Instant::now(),
-            )
-            .await;
+        actor.handle_in_event(
+            InEvent::Command(topic, proto::Command::Join(vec![])),
+            Instant::now(),
+        );
 
         // The origin of the shuffle reads the reply, then waits for the close.
         let origin = create_endpoint(rng, relay_map.clone(), None).await?;
