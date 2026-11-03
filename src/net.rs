@@ -46,7 +46,17 @@ mod util;
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/1";
 
 /// Channel capacity for the send queue (one per connection)
-const SEND_QUEUE_CAP: usize = 64;
+///
+/// Raised from upstream's 64: a burst that momentarily outruns the send
+/// loop must buffer, not drop. The send loop stalls on stream flow control
+/// whenever the peer's recv loop is descheduled, and the actor's
+/// `try_send` turns a full queue into loss. 64 turns ordinary bursts and
+/// load jitter into dropped broadcasts; 1024 absorbs them. A wedged peer
+/// (uni-stream credit exhausted, a stopped reader) still overflows the
+/// queue, so the loud drop path is unchanged — it is just no longer the
+/// first thing a busy connection hits.
+const SEND_QUEUE_CAP: usize = 1024;
+
 /// Channel capacity for the ToActor message queue (single)
 const TO_ACTOR_CAP: usize = 64;
 /// Channel capacity for the InEvent message queue (single)

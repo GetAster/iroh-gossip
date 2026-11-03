@@ -1047,17 +1047,17 @@ async fn former_instance_leaving_preserves_replacement() -> Result {
 
 /// A peer that stops reading does not block our shutdown.
 ///
-/// KNOWN BUG (#47): the actor waits when a peer's send queue is full, and
-/// then handles nothing else. `Frando/fix-slow-peer` fixes it.
+/// The actor drops messages on a full peer send queue instead of awaiting
+/// (fix 2 of the stream-credit hardening wave), so it keeps handling
+/// commands: the flood degrades to counted loss and shutdown completes.
 #[tokio::test(flavor = "multi_thread")]
 #[traced_test]
-#[should_panic(expected = "a flow-controlled peer blocked gossip shutdown")]
-async fn known_bug_slow_peer_does_not_block_shutdown() {
-    slow_peer_does_not_block_shutdown().await.unwrap();
+async fn slow_peer_does_not_block_shutdown() {
+    slow_peer_does_not_block_shutdown_impl().await.unwrap();
 }
 
-/// Runs `known_bug_slow_peer_does_not_block_shutdown`.
-async fn slow_peer_does_not_block_shutdown() -> Result {
+/// Runs `slow_peer_does_not_block_shutdown`.
+async fn slow_peer_does_not_block_shutdown_impl() -> Result {
     let lookup = MemoryLookup::new();
     let (a, b) = (Node::spawn(&lookup).await?, Node::spawn(&lookup).await?);
     let t = topic("review_backpressure");
