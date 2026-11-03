@@ -465,7 +465,14 @@ impl SendLoop {
         };
         let stream = entry.get_mut();
 
-        write_frame(stream, message, &mut self.buffer, self.max_message_size).await?;
+        match write_frame(stream, message, &mut self.buffer, self.max_message_size).await {
+            // Refused before any byte went out, so the stream is intact.
+            Err(WriteError::TooLarge { .. }) => {
+                warn!(max = self.max_message_size, "message too large, dropped");
+                return Ok(());
+            }
+            res => res?,
+        }
 
         if is_last {
             trace!(topic=%topic_id.fmt_short(), "stream closing");
