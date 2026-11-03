@@ -1066,7 +1066,7 @@ async fn connection_loop(
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
 
-    let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
+    let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size, metrics.clone());
     let sending = send_loop.sending();
     let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size, metrics);
     let mut handles_close = recv_loop.handles_close();
@@ -2215,7 +2215,7 @@ pub(crate) mod tests {
         let pair = TestPair::new(1).await?;
         let (conn, peer_conn) = pair.connect().await?;
         let (tx, rx) = mpsc::channel(1);
-        let mut send = SendLoop::new(conn, rx, TEST_FRAME_LIMIT);
+        let mut send = SendLoop::new(conn, rx, TEST_FRAME_LIMIT, Default::default());
         peer_conn.close(0u32.into(), b"done");
         timeout(Duration::from_secs(3), send.run(vec![]))
             .await
@@ -2547,7 +2547,7 @@ pub(crate) mod tests {
         ];
         let (send_tx, send_rx) = mpsc::channel(1);
         drop(send_tx);
-        let mut send_loop = SendLoop::new(conn, send_rx, 1024);
+        let mut send_loop = SendLoop::new(conn, send_rx, 1024, Default::default());
         let _send = AbortOnDropHandle::new(spawn(async move { send_loop.run(queue).await }));
 
         let (_, first) = timeout(Duration::from_secs(5), read_next_stream(&peer_conn))

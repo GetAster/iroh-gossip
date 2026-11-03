@@ -15,7 +15,7 @@ use iroh::{
 use n0_error::{e, stack_error};
 use n0_future::{
     task::JoinSet,
-    time::{sleep_until, Instant},
+    time::{sleep_until, timeout, Instant},
     FuturesUnordered, StreamExt,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -33,6 +33,9 @@ use crate::{
 
 /// Interval of the rate-limited drop warnings.
 pub(crate) const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long `open_uni` may pend before the stall is reported.
+const OPEN_UNI_WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// Whether a rate-limited warning may fire now: at most once per `every`.
 ///
@@ -289,6 +292,41 @@ pub(crate) struct SendLoop {
     send_rx: mpsc::Receiver<ProtoMessage>,
     /// Whether a message is queued or written, or a stream is not yet finished.
     sending: watch::Sender<bool>,
+    metrics: Arc<Metrics>,
+    /// Time of the last rate-limited "open_uni stalled" warning.
+    open_uni_stalled_warned: Option<std::time::Instant>,
+}
+
+/// Opens the topic's uni stream, reporting (rate-limited) when the open
+/// blocks on stream credit.
+///
+/// `conn.open_uni()` is cancellation-safe: it only waits on a budget
+/// notification before allocating the stream, so each time-box can drop
+/// it freely. A blocked open means the connection is at its
+/// `max_concurrent_uni_streams` and no stream is closing — the only
+/// cures are a higher limit or the peer closing streams.
+async fn open_uni_guarded(
+    conn: &Connection,
+    metrics: &Metrics,
+    warned: &mut Option<std::time::Instant>,
+    topic_id: TopicId,
+) -> Result<SendStream, WriteError> {
+    loop {
+        match timeout(OPEN_UNI_WARN_AFTER, conn.open_uni()).await {
+            Ok(result) => return result.map_err(Into::into),
+            Err(_elapsed) => {
+                metrics.open_uni_stalls.inc();
+                if warn_allowed(warned, DROP_WARN_INTERVAL) {
+                    warn!(
+                        topic = %topic_id.fmt_short(),
+                        "open_uni blocked for {}s ({} total): uni-stream credit exhausted",
+                        OPEN_UNI_WARN_AFTER.as_secs(),
+                        metrics.open_uni_stalls.get(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl SendLoop {
@@ -296,6 +334,7 @@ impl SendLoop {
         conn: Connection,
         send_rx: mpsc::Receiver<ProtoMessage>,
         max_message_size: usize,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             conn,
@@ -305,6 +344,8 @@ impl SendLoop {
             finishing: Default::default(),
             send_rx,
             sending: watch::channel(false).0,
+            metrics,
+            open_uni_stalled_warned: None,
         }
     }
 
@@ -409,7 +450,13 @@ impl SendLoop {
         let mut entry = match self.streams.entry(topic_id) {
             hash_map::Entry::Occupied(entry) => entry,
             hash_map::Entry::Vacant(entry) => {
-                let mut stream = self.conn.open_uni().await?;
+                let mut stream = open_uni_guarded(
+                    &self.conn,
+                    &self.metrics,
+                    &mut self.open_uni_stalled_warned,
+                    topic_id,
+                )
+                .await?;
                 let header = StreamHeader::new(topic_id);
                 header
                     .write(&mut stream, &mut self.buffer, self.max_message_size)

@@ -46,4 +46,6 @@ pub struct Metrics {
     pub send_queue_full_drops: Counter,
     /// Number of messages dropped because the actor's in_event channel was full
     pub in_event_full_drops: Counter,
+    /// Number of times an `open_uni` was still pending when its warn interval elapsed
+    pub open_uni_stalls: Counter,
 }
