@@ -31,7 +31,7 @@ use tracing::{debug, error, error_span, trace, warn, Instrument};
 
 use self::{
     address_lookup::GossipAddressLookup,
-    util::{RecvLoop, SendLoop, Timers},
+    util::{warn_allowed, RecvLoop, SendLoop, Timers, DROP_WARN_INTERVAL},
 };
 use crate::{
     api::{self, Command, Event, GossipApi, RpcMessage},
@@ -306,6 +306,8 @@ struct Actor {
     /// Tasks for the connection loops, to keep track of panics.
     connection_tasks: JoinSet<(EndpointId, Connection, Result<(), ConnectionLoopError>)>,
     metrics: Arc<Metrics>,
+    /// Time of the last rate-limited "per-peer send queue full" warning.
+    send_queue_full_warned: Option<std::time::Instant>,
     topic_event_forwarders: JoinSet<TopicId>,
     address_lookup: GossipAddressLookup,
 }
@@ -350,6 +352,7 @@ impl Actor {
             quit_queue: Default::default(),
             connection_tasks: Default::default(),
             metrics,
+            send_queue_full_warned: None,
             local_rx,
             topic_event_forwarders: Default::default(),
             address_lookup,
@@ -576,6 +579,7 @@ impl Actor {
         let in_event_tx = self.in_event_tx.clone();
 
         // Spawn a task for this connection
+        let metrics = self.metrics.clone();
         self.connection_tasks.spawn(
             async move {
                 let res = connection_loop(
@@ -587,6 +591,7 @@ impl Actor {
                     max_message_size,
                     queue,
                     wanted,
+                    metrics,
                 )
                 .await;
                 // Closed here, so that a busy actor does not delay the close.
@@ -742,13 +747,33 @@ impl Actor {
                     }
                     match state {
                         PeerState::Active { active_send_tx, .. } => {
-                            if let Err(_err) = active_send_tx.send(message).await {
-                                // Removing the peer is handled by the in_event PeerDisconnected sent
-                                // in [`Self::handle_connection_task_finished`].
-                                warn!(
-                                    peer = %peer_id.fmt_short(),
-                                    "failed to send: connection task send loop terminated",
-                                );
+                            match active_send_tx.try_send(message) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    // Removing the peer is handled by the in_event PeerDisconnected sent
+                                    // in [`Self::handle_connection_task_finished`].
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "failed to send: connection task send loop terminated",
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // The per-peer queue is full: the send loop is stuck
+                                    // behind a stream write (e.g. uni-stream credit).
+                                    // Dropping the message degrades to loss + resync;
+                                    // awaiting here wedges this serial actor.
+                                    self.metrics.send_queue_full_drops.inc();
+                                    if warn_allowed(
+                                        &mut self.send_queue_full_warned,
+                                        DROP_WARN_INTERVAL,
+                                    ) {
+                                        warn!(
+                                            peer = %peer_id.fmt_short(),
+                                            "per-peer send queue full, dropping message ({} dropped total)",
+                                            self.metrics.send_queue_full_drops.get(),
+                                        );
+                                    }
+                                }
                             }
                         }
                         PeerState::Pending { queue } | PeerState::Dropped { queue } => {
@@ -1037,12 +1062,13 @@ async fn connection_loop(
     max_message_size: usize,
     queue: Vec<ProtoMessage>,
     wanted: watch::Receiver<bool>,
+    metrics: Arc<Metrics>,
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
 
     let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
     let sending = send_loop.sending();
-    let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size);
+    let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size, metrics);
     let mut handles_close = recv_loop.handles_close();
 
     let send_fut = send_loop.run(queue).instrument(error_span!("send"));
@@ -2603,6 +2629,7 @@ pub(crate) mod tests {
             TEST_FRAME_LIMIT,
             vec![],
             watch::channel(true).1,
+            Default::default(),
         )));
 
         let (read_topic, read_message, peer_conn) = timeout(Duration::from_secs(5), peer)
@@ -2655,6 +2682,7 @@ pub(crate) mod tests {
                 1024,
                 vec![],
                 watch::channel(true).1,
+                Default::default(),
             ),
         )
         .await

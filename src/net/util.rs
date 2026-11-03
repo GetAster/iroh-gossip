@@ -3,6 +3,7 @@
 use std::{
     collections::{hash_map, HashMap},
     io,
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,7 +26,26 @@ use tokio::{
 use tracing::{debug, trace, warn, Instrument};
 
 use super::{InEvent, ProtoMessage};
-use crate::proto::{util::TimerMap, TopicId};
+use crate::{
+    metrics::Metrics,
+    proto::{util::TimerMap, TopicId},
+};
+
+/// Interval of the rate-limited drop warnings.
+pub(crate) const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a rate-limited warning may fire now: at most once per `every`.
+///
+/// Tracks the time of the last fire in the caller's `last` slot.
+pub(crate) fn warn_allowed(last: &mut Option<std::time::Instant>, every: Duration) -> bool {
+    let now = std::time::Instant::now();
+    if last.is_none_or(|l| now.duration_since(l) >= every) {
+        *last = Some(now);
+        true
+    } else {
+        false
+    }
+}
 
 /// Errors related to message writing
 #[allow(missing_docs)]
@@ -125,6 +145,9 @@ pub(crate) struct RecvLoop {
     in_event_tx: mpsc::Sender<InEvent>,
     /// Whether a stream header of the peer had [`StreamHeader::handles_close`].
     handles_close: watch::Sender<bool>,
+    metrics: Arc<Metrics>,
+    /// Time of the last rate-limited "in_event queue full" warning.
+    in_event_full_warned: Option<std::time::Instant>,
 }
 
 impl RecvLoop {
@@ -133,6 +156,7 @@ impl RecvLoop {
         conn: Connection,
         in_event_tx: mpsc::Sender<InEvent>,
         max_message_size: usize,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             remote_endpoint_id,
@@ -140,6 +164,8 @@ impl RecvLoop {
             max_message_size,
             in_event_tx,
             handles_close: watch::channel(false).0,
+            metrics,
+            in_event_full_warned: None,
         }
     }
 
@@ -184,9 +210,27 @@ impl RecvLoop {
                     match msg {
                         None => debug!(topic=%state.header.topic_id.fmt_short(), "stream closed"),
                         Some(msg) => {
-                            if self.in_event_tx.send(InEvent::RecvMessage(self.remote_endpoint_id, msg)).await.is_err() {
-                                debug!("stop recv loop: actor closed");
-                                break;
+                            match self.in_event_tx.try_send(InEvent::RecvMessage(self.remote_endpoint_id, msg)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    debug!("stop recv loop: actor closed");
+                                    break;
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // The actor's in_event channel is full: the actor is
+                                    // stuck behind one of its own sends (e.g. stream
+                                    // credit). Dropping the message degrades to loss +
+                                    // resync; awaiting here would stall this recv loop
+                                    // and with it connection flow control both ways.
+                                    self.metrics.in_event_full_drops.inc();
+                                    if warn_allowed(&mut self.in_event_full_warned, DROP_WARN_INTERVAL) {
+                                        warn!(
+                                            topic = %state.header.topic_id.fmt_short(),
+                                            "in_event queue full, dropping message ({} dropped total)",
+                                            self.metrics.in_event_full_drops.get(),
+                                        );
+                                    }
+                                }
                             }
                             read_futures.push(state.next());
                         }

@@ -42,4 +42,8 @@ pub struct Metrics {
     pub actor_tick_in_event_rx: Counter,
     /// Number of times the actor ticked for a timer event
     pub actor_tick_timers: Counter,
+    /// Number of messages dropped because a peer's send queue was full
+    pub send_queue_full_drops: Counter,
+    /// Number of messages dropped because the actor's in_event channel was full
+    pub in_event_full_drops: Counter,
 }
