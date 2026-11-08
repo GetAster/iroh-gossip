@@ -23,9 +23,9 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.101.0` |
 | Integration branch | `upgrade/iroh-gossip-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-gossip-v<upstream version>`) |
-| Tag | `aster-iroh-gossip-v0.101.1002` |
-| Pinned commit | `602bbb719ece3c2314faf732639a29a582fdf9ed` |
-| Crate version | 0.101.1002 (workspace spec `iroh-gossip = "0.101.1002"`) |
+| Tag | `aster-iroh-gossip-v0.101.1003` |
+| Pinned commit | `4e2806907272633748c5bee45c6f4e263cd94f88` |
+| Crate version | 0.101.1003 (workspace spec `iroh-gossip = "0.101.1003"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-gossip.git` |
 
 The fork's own `[patch.crates-io]` (row 17) pins iroh `9ba1447d` (1.4.2002) and noq `379f73677c` (1.4.1001), the stack Aster links it against (unchanged from 0.101.1-p7). The crate code is 0.101.1002: the version was bumped at `d2e14fb3` after rows 55 and 56 landed, and the wave's later commits (rows 55/56 follow-ups and row 58) landed before the first tag of 0.101.1002, which points at the pinned commit; nothing at `d2e14fb3` was tagged or published. `-p1` to `-p7` (0.101.1) change only the patch block and lock.
@@ -33,7 +33,7 @@ The fork's own `[patch.crates-io]` (row 17) pins iroh `9ba1447d` (1.4.2002) and 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "602bbb719ece3c2314faf732639a29a582fdf9ed" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "4e2806907272633748c5bee45c6f4e263cd94f88" }
 ```
 
 ## Patches
@@ -47,6 +47,7 @@ Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, 
 | 55 | `fix/i-stall-hardening` | The actor's per-peer send (`src/net.rs`) and the recv loop's `in_event_tx` send (`src/net/util.rs`) `try_send` + drop on a full queue instead of awaiting forever, with counters (`send_queue_full_drops`, `in_event_full_drops`) and 10 s rate-limited warns; the per-peer send queue cap is raised 64 → 1024 so ordinary bursts buffer instead of dropping; the in_event dispatch path is made sync. Files: `src/net.rs`, `src/net/util.rs`, `tests/e2e.rs`. | §I bench (`_internal/docs/aster-rpc/261103_i-bench-deadlock.md`): at the QUIC uni-stream credit wall (one uni stream per topic held open, 100/direction) the send loop blocks in `open_uni`/`write_frame`, the 64-cap per-peer queue fills, and the serial actor wedges in the awaited send — one wedged peer took the node's whole gossip down. Drop + warn turns the wall into counted loss + resync instead of a wedge (the owner's regression run: limit 100, fix 2 only → 2922 drops, the bench completes, no wedge). Fixes upstream #47. | `f4f43823` (same on topic and upgrade); `ad84a32b` on the topic, `7f8bbbca` on upgrade (de-async); `a528b006` upgrade-only (cap 1024 + the slow-peer test rewritten for the fixed behaviour) | carried | The slow-peer test diverges from upstream's `known_bug_slow_peer_does_not_block_shutdown` (`#[should_panic]`): ours asserts the flood degrades to counted loss and shutdown completes. |
 | 56 | `fix/i-stall-hardening` | Time-boxes the send loop's `conn.open_uni()` (5 s) with a rate-limited warn naming the topic and an `open_uni_stalls` counter. File: `src/net/util.rs`. | A blocked `open_uni` means the connection is at its uni-stream limit with no stream closing — it pends silently forever (nine instrumented bench runs to find it). Exhaustion must be loud. The cure is Aster's `transport_max_concurrent_uni_streams` default of 1M (Aster core, not this fork). | `6eb304c0` (same on topic and upgrade) | carried | |
 | 58 | none recorded (upstream backport) | Cherry-picks upstream #195 (`5592b477`: a per-peer close flag — a connection on which neither peer ever opens a stream now retires once the peer is known to handle the close, with 20 s flag retention) and takes upstream #187's send side (`6bb9fe07`: an oversized message is dropped and its topic stream kept, instead of reset — the reset lost every later message queued on the stream). Files: `src/net.rs`, `src/net/util.rs`, `tests/e2e.rs`. | #195 fixes the run-varying `open_connections_link_neighbors` failures in the upstream suite — a connection leak plus a false positive in the test's pair-based check — so the suite is deterministic for this wave's release gate. #195's own size-limit tests assume #187's drop-and-keep behaviour. The rest of #187 (API-level refusal: `broadcast` returns `ApiError::TooLarge`, `max_content_size`) is not taken. | upstream `5592b477` (#195), `6bb9fe07` (#187) / upgrade `7b30e0f7`, `602bbb71` | carried | **Drop when a released iroh-gossip containing upstream #195 and #187 is pinned.** |
+| 83 | none recorded (`4e280690`) | Idle topics set no periodic timers. Plumtree arms `EvictCache` only while either message cache holds entries, for the earliest expiry and no sooner than `cache_evict_interval` (it re-armed every second unconditionally). HyParView runs `DoMaintenance` every 5 s while the active view is short and every 60 s (`STABLE_MAINTENANCE_INTERVAL`) otherwise; a view that turns short re-arms the short cadence, and a timer generation (`DoMaintenance(u64)`) keeps a superseded timer from running or re-arming. Files: `src/proto/plumtree.rs`, `src/proto/hyparview.rs`, `src/proto/state.rs`, `src/proto/util.rs`. | portal-sync §V: the gossip actor was 35-47% of idle tokio samples, two timers per topic and about 200 topics per daemon. | `4e280690` | carried | Losing an active peer still refills at once (`remove_active`), so the 60 s backstop only matters for a view that stays short of refills. Tests: `plumtree::test::eviction_timer_runs_only_while_caches_hold_entries`, `hyparview::tests::maintenance_backs_off_while_the_view_is_healthy`. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
@@ -133,7 +134,11 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### i-stall-hardening wave (2026-11-03), current
+### Idle timers (2026-11-08), current
+
+- **`aster-iroh-gossip-v0.101.1003`** (`4e280690`): row 83 (idle topics set no periodic timers). Lib and integration suites pass (one early full-suite run had a single lib failure that did not reproduce in 3 full runs, 5 lib runs, 6 parallel lib runs and 15 net-test loops). iroh-docs re-pins to it in `aster-iroh-docs-v0.101.1033`.
+
+### i-stall-hardening wave (2026-11-03)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
