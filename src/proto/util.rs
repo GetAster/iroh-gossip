@@ -350,6 +350,12 @@ impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
         self.map.is_empty()
     }
 
+    /// The earliest expiry instant of any entry, if there is one. It may
+    /// belong to an entry that was since re-inserted with a later expiry.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.expiry.first().copied()
+    }
+
     /// Get an item from the cache.
     pub fn get(&self, key: &K) -> Option<&V> {
         self.map.get(key).map(|(_expires, value)| value)

@@ -94,7 +94,7 @@ impl<PI> Timer<PI> {
         matches!(
             self.timer,
             topic::Timer::Swarm(
-                super::hyparview::Timer::DoShuffle | super::hyparview::Timer::DoMaintenance
+                super::hyparview::Timer::DoShuffle | super::hyparview::Timer::DoMaintenance(_)
             )
         )
     }

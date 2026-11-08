@@ -377,8 +377,9 @@ pub struct State<PI> {
     /// Whether a [`Timer::DispatchLazyPush`] has been scheduled.
     dispatch_timer_scheduled: bool,
 
-    /// Set to false after the first message is received. Used for initial timer scheduling.
-    init: bool,
+    /// Whether a [`Timer::EvictCache`] is scheduled. It is armed only while
+    /// either message cache holds entries, so an idle topic sets no timer.
+    evict_timer_scheduled: bool,
 
     /// [`Stats`] of this plumtree.
     pub(crate) stats: Stats,
@@ -400,7 +401,7 @@ impl<PI: PeerIdentity> State<PI> {
             graft_timer_scheduled: Default::default(),
             dispatch_timer_scheduled: false,
             cache: Default::default(),
-            init: false,
+            evict_timer_scheduled: false,
             stats: Default::default(),
             max_message_size,
         }
@@ -408,10 +409,6 @@ impl<PI: PeerIdentity> State<PI> {
 
     /// Handle an [`InEvent`].
     pub fn handle(&mut self, event: InEvent<PI>, now: Instant, io: &mut impl IO<PI>) {
-        if !self.init {
-            self.init = true;
-            self.on_evict_cache_timer(now, io)
-        }
         match event {
             InEvent::RecvMessage(from, message) => self.handle_message(from, message, now, io),
             InEvent::Broadcast(data, scope) => self.broadcast(data, scope, now, io),
@@ -425,6 +422,8 @@ impl<PI: PeerIdentity> State<PI> {
                 Timer::EvictCache => self.on_evict_cache_timer(now, io),
             },
         }
+
+        self.schedule_evict(now, io);
 
         #[cfg(test)]
         self.check_invariants();
@@ -737,13 +736,33 @@ impl<PI: PeerIdentity> State<PI> {
         self.lazy_push_queue.remove(&peer);
     }
 
-    fn on_evict_cache_timer(&mut self, now: Instant, io: &mut impl IO<PI>) {
+    fn on_evict_cache_timer(&mut self, now: Instant, _io: &mut impl IO<PI>) {
+        self.evict_timer_scheduled = false;
         self.cache.expire_until(now);
         self.received_messages.expire_until(now);
-        io.push(OutEvent::ScheduleTimer(
-            self.config.cache_evict_interval,
-            Timer::EvictCache,
-        ));
+    }
+
+    /// Arms [`Timer::EvictCache`] for the earliest expiry in either cache, but
+    /// no sooner than `cache_evict_interval`, unless one is already armed or
+    /// both caches are empty. Runs after every event, so a cache that gains
+    /// entries always gets a timer and an empty one never keeps a topic awake.
+    fn schedule_evict(&mut self, now: Instant, io: &mut impl IO<PI>) {
+        if self.evict_timer_scheduled {
+            return;
+        }
+        let next = match (
+            self.cache.next_expiry(),
+            self.received_messages.next_expiry(),
+        ) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return,
+        };
+        let delay = next
+            .saturating_duration_since(now)
+            .max(self.config.cache_evict_interval);
+        self.evict_timer_scheduled = true;
+        io.push(OutEvent::ScheduleTimer(delay, Timer::EvictCache));
     }
 
     /// Moves peer into eager set.
@@ -1080,6 +1099,11 @@ mod test {
                 delivered_from: 3,
                 scope: DeliveryScope::Swarm(Round(6)),
             })));
+            // The first cached message arms the eviction timer, for its expiry.
+            io.push(OutEvent::ScheduleTimer(
+                config.message_cache_retention,
+                Timer::EvictCache,
+            ));
             io
         };
         assert_eq!(io, expected);
@@ -1150,10 +1174,6 @@ mod test {
         let expected = {
             let mut io = VecDeque::new();
             io.push(OutEvent::ScheduleTimer(
-                config.cache_evict_interval,
-                Timer::EvictCache,
-            ));
-            io.push(OutEvent::ScheduleTimer(
                 config.dispatch_timeout,
                 Timer::DispatchLazyPush,
             ));
@@ -1162,6 +1182,11 @@ mod test {
                 delivered_from: 2,
                 scope: DeliveryScope::Swarm(Round(1)),
             })));
+            // The first cached message arms the eviction timer, for its expiry.
+            io.push(OutEvent::ScheduleTimer(
+                config.message_cache_retention,
+                Timer::EvictCache,
+            ));
             io
         };
         assert_eq!(io, expected);
@@ -1177,6 +1202,69 @@ mod test {
         state.handle(InEvent::RecvMessage(2, message), now, &mut io);
         let expected = VecDeque::new();
         assert_eq!(io, expected);
+    }
+
+    /// An idle topic arms no eviction timer, and the timer stops once both
+    /// caches are empty, so a topic with nothing to evict never wakes.
+    #[test]
+    fn eviction_timer_runs_only_while_caches_hold_entries() {
+        macro_rules! evicts {
+            ($io:expr) => {
+                $io.iter()
+                    .filter_map(|event| match event {
+                        topic::OutEvent::ScheduleTimer(
+                            delay,
+                            topic::Timer::Gossip(Timer::EvictCache),
+                        ) => Some(*delay),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+        }
+        let config: Config = Default::default();
+        let mut state = State::new(1, config.clone(), 1024);
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::NeighborDown(2), now, &mut io);
+        assert!(
+            evicts!(io).is_empty(),
+            "an idle topic arms no eviction timer"
+        );
+
+        let content: Bytes = b"hello".to_vec().into();
+        let message = Message::Gossip(Gossip {
+            content: content.clone(),
+            id: MessageId::from_content(&content),
+            scope: DeliveryScope::Swarm(Round(1)),
+        });
+        let mut io = VecDeque::new();
+        state.handle(InEvent::RecvMessage(2, message), now, &mut io);
+        assert_eq!(
+            evicts!(io),
+            vec![config.message_cache_retention],
+            "the first cached message arms one timer, for its expiry"
+        );
+
+        // The payload expires first; the id stays until its own retention.
+        let at = now + config.message_cache_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), at, &mut io);
+        assert!(state.cache.is_empty());
+        assert_eq!(
+            evicts!(io),
+            vec![config.message_id_retention - config.message_cache_retention],
+            "the timer re-arms for the retained message id's expiry"
+        );
+
+        let at = now + config.message_id_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), at, &mut io);
+        assert!(state.received_messages.is_empty());
+        assert!(
+            evicts!(io).is_empty(),
+            "with both caches empty the timer is not re-armed"
+        );
     }
 
     #[test]
