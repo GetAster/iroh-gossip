@@ -169,8 +169,13 @@ impl GossipApi {
     /// Returns a [`GossipTopic`] instantly. To wait for at least one connection to be established,
     /// you can await [`GossipTopic::joined`].
     ///
-    /// Messages will be queued until a first connection is available. If the internal channel becomes full,
-    /// the oldest messages will be dropped from the channel.
+    /// See [`JoinOptions`] for available options.
+    ///
+    /// A broadcast reaches only the neighbors that exist when the node sends it. Await
+    /// [`GossipTopic::joined`] before the first broadcast. With no bootstrap peers, the node
+    /// waits until another node joins it.
+    ///
+    /// The node leaves the topic when you drop all handles of the topic.
     pub async fn subscribe_with_opts(
         &self,
         topic_id: TopicId,
@@ -189,6 +194,9 @@ impl GossipApi {
     }
 
     /// Join a gossip topic with the default options and wait for at least one active connection.
+    ///
+    /// This call has no timeout. If no peer becomes a neighbor, it waits forever. This happens
+    /// when all bootstrap peers are offline. Wrap the call in a timeout to stop the wait.
     pub async fn subscribe_and_join(
         &self,
         topic_id: TopicId,
@@ -220,6 +228,20 @@ impl GossipApi {
 }
 
 /// Sender for a gossip topic.
+///
+/// Each broadcast is checked before the protocol processes it. When the data
+/// sections of all eager-peer send queues are half full, it waits for pressure
+/// to ease, up to 100 ms. Commands behind it in the same subscription keep their
+/// order and wait with it, including joins and the leave when its last handle drops.
+/// Other subscriptions continue independently.
+///
+/// Sending a command waits for space in the subscription's command channel.
+/// The 100 ms limit bounds one broadcast's admission wait, not this API call,
+/// commands queued ahead of it, or delivery to a peer.
+///
+/// See [`QueueOptions`] for what this means for your app.
+///
+/// [`QueueOptions`]: crate::net::QueueOptions
 #[derive(Debug, Clone)]
 pub struct GossipSender {
     sender: mpsc::Sender<Command>,
@@ -259,10 +281,20 @@ impl GossipSender {
 
     /// Broadcasts a message to all endpoints.
     ///
+    /// `Ok` means that the node accepted the message, not that a peer received it.
+    /// Delivery is best effort, and the order of messages from different senders is not defined.
+    /// Your own broadcast does not come back as [`Event::Received`].
+    ///
+    /// A peer ignores a message with the same content as one that it saw in the last 90 seconds
+    /// (the default of [`PlumtreeConfig::message_id_retention`]). To send the same payload twice,
+    /// add a nonce or a sequence number to the content.
+    ///
     /// # Errors
     ///
     /// Returns [`ApiError::TooLarge`] if the content is over
     /// [`Self::max_content_size`].
+    ///
+    /// [`PlumtreeConfig::message_id_retention`]: crate::proto::PlumtreeConfig::message_id_retention
     pub async fn broadcast(&self, message: Bytes) -> Result<(), ApiError> {
         self.check_size(&message)?;
         self.send(Command::Broadcast(message)).await?;
@@ -270,6 +302,9 @@ impl GossipSender {
     }
 
     /// Broadcasts a message to our direct neighbors.
+    ///
+    /// The neighbors do not relay the message. A neighbor whose send queue is full does not get
+    /// it, and there is no repair or retransmission for neighbor-only broadcasts.
     ///
     /// # Errors
     ///
@@ -280,7 +315,11 @@ impl GossipSender {
         Ok(())
     }
 
-    /// Joins a set of peers.
+    /// Joins the topic through `peers`.
+    ///
+    /// A peer that is already a neighbor gets no join, as it would forward the
+    /// join to all its neighbors. A join without an answer goes out once more
+    /// after 10 seconds.
     pub async fn join_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
         self.send(Command::JoinPeers(peers)).await?;
         Ok(())
@@ -396,6 +435,10 @@ impl GossipReceiver {
     }
 
     /// Lists our current direct neighbors.
+    ///
+    /// This list follows the [`Event::NeighborUp`] and [`Event::NeighborDown`] events that this
+    /// receiver read. It is out of date until you poll the stream, and after an
+    /// [`Event::Lagged`].
     pub fn neighbors(&self) -> impl Iterator<Item = EndpointId> + '_ {
         self.neighbors.iter().copied()
     }
@@ -452,7 +495,11 @@ pub enum Event {
     NeighborDown(EndpointId),
     /// We received a gossip message for this topic.
     Received(Message),
-    /// We missed some messages because our [`GossipReceiver`] was not progressing fast enough.
+    /// We missed some events because our [`GossipReceiver`] was not progressing fast enough.
+    ///
+    /// The missed events can include [`Event::Received`], [`Event::NeighborUp`], and
+    /// [`Event::NeighborDown`]. The subscription stays open. See
+    /// [`JoinOptions::subscription_capacity`] to set the capacity of the channel.
     Lagged,
 }
 
@@ -480,6 +527,9 @@ pub struct Message {
     /// This tells us if the message is from a direct neighbor or actual gossip.
     pub scope: DeliveryScope,
     /// The endpoint that delivered the message. This is not the same as the original author.
+    ///
+    /// A gossip message has no author field, and the content is not signed. If you need to know
+    /// the author, or need to trust the content, sign it in your app.
     pub delivered_from: EndpointId,
 }
 
@@ -495,18 +545,26 @@ pub enum Command {
     JoinPeers(Vec<EndpointId>),
 }
 
+impl Command {
+    /// Returns whether this command publishes a message.
+    pub(crate) fn is_broadcast(&self) -> bool {
+        matches!(self, Self::Broadcast(_) | Self::BroadcastNeighbors(_))
+    }
+}
+
 /// Options for joining a gossip topic.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct JoinOptions {
     /// The initial bootstrap endpoints.
     pub bootstrap: BTreeSet<EndpointId>,
-    /// The maximum number of messages that can be buffered in a subscription.
+    /// The number of events that a subscription buffers for a reader that falls behind.
     ///
-    /// If this limit is reached, the subscriber will receive a `Lagged` response,
-    /// the message will be dropped, and the subscriber will be closed.
+    /// A slow reader never blocks the gossip actor. When the buffer is full, the node drops
+    /// the oldest events and the reader receives a [`Event::Lagged`]. The
+    /// subscription stays open.
     ///
-    /// This is to prevent a single slow subscriber from blocking the dispatch loop.
-    /// If a subscriber is lagging, it should be closed and re-opened.
+    /// After a `Lagged`, the neighbors that [`GossipReceiver::neighbors`] reports can be wrong.
+    /// If you need the exact state, subscribe again.
     pub subscription_capacity: usize,
 }
 

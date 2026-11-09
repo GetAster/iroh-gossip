@@ -13,8 +13,10 @@ use std::{
 
 use bytes::Bytes;
 use derive_more::{Add, From, Sub};
+use indexmap::IndexMap;
 use n0_future::time::{Duration, Instant};
 use postcard::experimental::max_size::MaxSize;
+use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -55,6 +57,8 @@ pub enum InEvent<PI> {
     NeighborUp(PI),
     /// Peer `PI` has disconnected from the topic.
     NeighborDown(PI),
+    /// The network dropped a [`Message`] to peer `PI`, as the queue to it was full.
+    SendDropped(PI, Message),
 }
 
 /// Events Plumtree emits.
@@ -81,6 +85,8 @@ pub enum Timer {
     DispatchLazyPush,
     /// Evict the message cache
     EvictCache,
+    /// Announce again the messages that a full send queue dropped.
+    AnnounceDropped,
 }
 
 /// Event emitted by the [`State`] to the application.
@@ -152,6 +158,36 @@ pub enum Message {
     /// When receiving IHave, do nothing initially, and request the messages for the included
     /// message IDs after some time if they aren't pushed eagerly to us.
     IHave(Vec<IHave>),
+}
+
+#[cfg(all(test, feature = "net"))]
+impl Message {
+    /// Returns a payload of `len` bytes, as an eager push sends it, for the network tests.
+    pub(crate) fn test_gossip(len: usize) -> Self {
+        Self::test_payload(Bytes::from(vec![7u8; len]))
+    }
+
+    /// Returns a payload with `content`, as its publisher sends it, for the network tests.
+    pub(crate) fn test_payload(content: Bytes) -> Self {
+        Message::Gossip(Gossip {
+            id: MessageId::from_content(&content),
+            content,
+            scope: DeliveryScope::Swarm(Round(0)),
+        })
+    }
+
+    /// Returns an `IHave` of one message, for the network tests.
+    pub(crate) fn test_ihave() -> Self {
+        Message::IHave(vec![IHave {
+            id: MessageId::from_content(b"announced"),
+            round: Round(0),
+        }])
+    }
+
+    /// Returns a `Prune`, for the network tests.
+    pub(crate) fn test_prune() -> Self {
+        Message::Prune
+    }
 }
 
 /// Payload messages transmitted by the protocol.
@@ -375,6 +411,35 @@ pub struct Stats {
     pub max_last_delivery_hop: u16,
 }
 
+/// The grafts we sent for one message.
+#[derive(Debug)]
+struct Grafts<PI> {
+    /// The peers we grafted, with the hops they announced, which their replies take too.
+    peers: Vec<(PI, Round)>,
+    /// The sender of the first copy, and the hops it took, once it came.
+    first: Option<(PI, Round)>,
+    /// The grafted peer that replaced the sender of the first copy.
+    kept: Option<PI>,
+}
+
+impl<PI: PartialEq> Grafts<PI> {
+    /// Returns whether we grafted `peer`.
+    fn contains(&self, peer: &PI) -> bool {
+        self.peers.iter().any(|(grafted, _)| grafted == peer)
+    }
+}
+
+/// The most dropped messages per peer that we keep to announce again.
+const MAX_DROPPED_PER_PEER: usize = 256;
+/// The most dropped messages per topic that we keep to announce again.
+///
+/// At a tick, the ids move to the queue of announcements, which has no cap.
+const MAX_DROPPED: usize = 4096;
+/// The most dropped messages that we announce to a peer again per [`Timer::AnnounceDropped`].
+const DROPPED_PER_TICK: usize = 64;
+/// The time between two [`Timer::AnnounceDropped`].
+const ANNOUNCE_DROPPED_INTERVAL: Duration = Duration::from_secs(1);
+
 /// State of the plumtree.
 #[derive(Debug)]
 pub struct State<PI> {
@@ -389,20 +454,32 @@ pub struct State<PI> {
     pub(crate) lazy_push_peers: BTreeSet<PI>,
 
     lazy_push_queue: BTreeMap<PI, Vec<IHave>>,
+    /// Messages that a full queue to the peer dropped, to announce to the peer again.
+    ///
+    /// They go out with [`Timer::AnnounceDropped`], not at once. A graft reply that
+    /// the full queue drops again would otherwise loop at the speed of a round trip.
+    dropped: BTreeMap<PI, IndexMap<MessageId, Round, FxBuildHasher>>,
 
     /// Messages for which a [`MessageId`] has been seen via a [`Message::IHave`] but we have not
     /// yet received the full payload. For each, we store the peers that have claimed to have this
     /// message.
     missing_messages: HashMap<MessageId, VecDeque<(PI, Round)>>,
     /// Messages for which the full payload has been seen.
-    received_messages: TimeBoundCache<MessageId, ()>,
+    received_messages: TimeBoundCache<MessageId, (), FxBuildHasher>,
+    /// The grafts we sent for a message, see [`Self::on_late_graft_reply`].
+    ///
+    /// Entries expire `message_cache_retention` after the first graft. A later
+    /// reply is a plain duplicate.
+    grafted: TimeBoundCache<MessageId, Grafts<PI>>,
     /// Payloads of received messages.
-    cache: TimeBoundCache<MessageId, Gossip>,
+    cache: TimeBoundCache<MessageId, Gossip, FxBuildHasher>,
 
     /// Message ids for which a [`Timer::SendGraft`] has been scheduled.
     graft_timer_scheduled: HashSet<MessageId>,
     /// Whether a [`Timer::DispatchLazyPush`] has been scheduled.
     dispatch_timer_scheduled: bool,
+    /// Whether a [`Timer::AnnounceDropped`] has been scheduled.
+    announce_dropped_scheduled: bool,
 
     /// Set to false after the first message is received. Used for initial timer scheduling.
     init: bool,
@@ -421,12 +498,15 @@ impl<PI: PeerIdentity> State<PI> {
             eager_push_peers: Default::default(),
             lazy_push_peers: Default::default(),
             lazy_push_queue: Default::default(),
+            dropped: Default::default(),
             config,
             missing_messages: Default::default(),
-            received_messages: Default::default(),
+            received_messages: TimeBoundCache::with_hasher(FxBuildHasher),
+            grafted: Default::default(),
             graft_timer_scheduled: Default::default(),
             dispatch_timer_scheduled: false,
-            cache: Default::default(),
+            announce_dropped_scheduled: false,
+            cache: TimeBoundCache::with_hasher(FxBuildHasher),
             init: false,
             stats: Default::default(),
             max_message_size,
@@ -444,12 +524,14 @@ impl<PI: PeerIdentity> State<PI> {
             InEvent::Broadcast(data, scope) => self.broadcast(data, scope, now, io),
             InEvent::NeighborUp(peer) => self.on_neighbor_up(peer),
             InEvent::NeighborDown(peer) => self.on_neighbor_down(peer),
+            InEvent::SendDropped(peer, message) => self.on_send_dropped(peer, message, io),
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DispatchLazyPush => self.on_dispatch_timer(io),
                 Timer::SendGraft(id) => {
-                    self.on_send_graft_timer(id, io);
+                    self.on_send_graft_timer(id, now, io);
                 }
                 Timer::EvictCache => self.on_evict_cache_timer(now, io),
+                Timer::AnnounceDropped => self.on_announce_dropped_timer(io),
             },
         }
 
@@ -470,7 +552,7 @@ impl<PI: PeerIdentity> State<PI> {
                 "{peer:?} is both eager and lazy"
             );
         }
-        for peer in self.lazy_push_queue.keys() {
+        for peer in self.lazy_push_queue.keys().chain(self.dropped.keys()) {
             assert!(
                 self.lazy_push_peers.contains(peer) || self.eager_push_peers.contains(peer),
                 "announcements queued for {peer:?}, which is no peer"
@@ -515,6 +597,14 @@ impl<PI: PeerIdentity> State<PI> {
             - 5;
         let chunk_len = chunk_size / IHave::POSTCARD_MAX_SIZE;
         while let Some((peer, list)) = self.lazy_push_queue.pop_first() {
+            if list.is_empty() {
+                continue;
+            }
+            // A batch that fits one frame can hand its allocation to the outgoing message.
+            if list.len() <= chunk_len {
+                io.push(OutEvent::SendMessage(peer, Message::IHave(list)));
+                continue;
+            }
             for chunk in list.chunks(chunk_len) {
                 io.push(OutEvent::SendMessage(peer, Message::IHave(chunk.to_vec())));
             }
@@ -549,10 +639,10 @@ impl<PI: PeerIdentity> State<PI> {
                 message.clone(),
                 now + self.config.message_cache_retention,
             );
-            self.lazy_push(message.clone(), &me, io);
+            self.lazy_push(&message, &me, io);
         }
 
-        self.eager_push(message.clone(), &me, io);
+        self.eager_push(&message, &me, &[], io);
     }
 
     /// Handle receiving a [`Message::Gossip`].
@@ -579,6 +669,9 @@ impl<PI: PeerIdentity> State<PI> {
         // and notify peer about this.
         if self.received_messages.contains_key(&message.id) {
             debug!(hash = %message.id.fmt_short(), "Received duplicate message... ignoring");
+            if self.on_late_graft_reply(sender, &message, io) {
+                return;
+            }
             if from_peer {
                 self.add_lazy(sender);
             }
@@ -604,14 +697,28 @@ impl<PI: PeerIdentity> State<PI> {
                     message.clone(),
                     now + self.config.message_cache_retention,
                 );
-                // push the message to our peers
-                self.eager_push(message.clone(), &sender, io);
-                self.lazy_push(message.clone(), &sender, io);
+                // Push the message to our peers. A peer we grafted for it
+                // has it already, and sends it to us.
+                // A graft reply over no more hops can change the tree, see
+                // `on_late_graft_reply`. The tree optimization would only see
+                // the announcements left after the graft.
+                let (grafted, graft_out) = match self.grafted.get_mut(&message.id) {
+                    Some(grafts) => {
+                        grafts.first = Some((sender, prev_round));
+                        let out = grafts.peers.iter().any(|(_, round)| *round <= prev_round)
+                            && !grafts.contains(&sender);
+                        let peers = grafts.peers.iter().map(|(peer, _)| *peer).collect();
+                        (peers, out)
+                    }
+                    None => (Vec::new(), false),
+                };
+                self.eager_push(&message, &sender, &grafted, io);
+                self.lazy_push(&message, &sender, io);
                 // cleanup places where we track missing messages
                 self.graft_timer_scheduled.remove(&message.id);
                 let previous_ihaves = self.missing_messages.remove(&message.id);
                 // do the optimization step from the paper
-                if let Some(previous_ihaves) = previous_ihaves.filter(|_| from_peer) {
+                if let Some(previous_ihaves) = previous_ihaves.filter(|_| from_peer && !graft_out) {
                     self.optimize_tree(&sender, &message, previous_ihaves, io);
                 }
                 self.stats.max_last_delivery_hop = self
@@ -625,6 +732,46 @@ impl<PI: PeerIdentity> State<PI> {
                 GossipEvent::from_message(&message, sender),
             )));
         }
+    }
+
+    /// Handles a duplicate that a peer we grafted sends after the eager copy came.
+    ///
+    /// The peer announced the message more than a graft timeout before the
+    /// eager copy arrived, so its path is faster. If its copy took no more
+    /// hops, it stays eager, and the sender of the eager copy turns lazy.
+    /// Otherwise the graft and its duplicate would repeat for each message.
+    /// The peer is not below us, as it announced the message before we had it.
+    /// The hop check keeps [`Self::optimize_tree`] from undoing the change on
+    /// the next message. A reply to a retried graft is ignored.
+    ///
+    /// Returns whether it handled the duplicate.
+    fn on_late_graft_reply(&mut self, sender: PI, message: &Gossip, io: &mut impl IO<PI>) -> bool {
+        let Some(grafts) = self.grafted.get_mut(&message.id) else {
+            return false;
+        };
+        let Some((first, first_round)) = grafts.first else {
+            return false;
+        };
+        if !grafts.contains(&sender) {
+            return false;
+        }
+        // A retry brings a second reply from a peer that already gave us the message.
+        if first == sender || grafts.kept == Some(sender) {
+            return true;
+        }
+        let no_more_hops = message.round().is_some_and(|round| round <= first_round);
+        if !no_more_hops
+            || grafts.contains(&first)
+            || !self.eager_push_peers.contains(&sender)
+            || !self.eager_push_peers.contains(&first)
+        {
+            return false;
+        }
+        grafts.kept = Some(sender);
+        debug!(peer = ?sender, slower = ?first, "keep a faster grafted peer");
+        self.add_lazy(first);
+        io.push(OutEvent::SendMessage(first, Message::Prune));
+        true
     }
 
     /// Optimize the tree by pruning the `sender` of a [`Message::Gossip`] if we previously
@@ -680,10 +827,13 @@ impl<PI: PeerIdentity> State<PI> {
     fn on_ihave(&mut self, sender: PI, ihaves: Vec<IHave>, io: &mut impl IO<PI>) {
         for ihave in ihaves {
             if !self.received_messages.contains_key(&ihave.id) {
-                self.missing_messages
-                    .entry(ihave.id)
-                    .or_default()
-                    .push_back((sender, ihave.round));
+                // Queue each peer once, as it answers every graft. A new
+                // announcement after a graft is a retry, for example after a
+                // dropped reply.
+                let announcers = self.missing_messages.entry(ihave.id).or_default();
+                if !announcers.iter().any(|(peer, _)| *peer == sender) {
+                    announcers.push_back((sender, ihave.round));
+                }
 
                 if !self.graft_timer_scheduled.contains(&ihave.id) {
                     self.graft_timer_scheduled.insert(ihave.id);
@@ -697,7 +847,7 @@ impl<PI: PeerIdentity> State<PI> {
     }
 
     /// A scheduled [`Timer::SendGraft`] has reached it's deadline.
-    fn on_send_graft_timer(&mut self, id: MessageId, io: &mut impl IO<PI>) {
+    fn on_send_graft_timer(&mut self, id: MessageId, now: Instant, io: &mut impl IO<PI>) {
         self.graft_timer_scheduled.remove(&id);
         // if the message was received before the timer ran out, there is no need to request it
         // again
@@ -718,6 +868,21 @@ impl<PI: PeerIdentity> State<PI> {
         }
         if let Some((peer, round)) = entry {
             self.add_eager(peer);
+            match self.grafted.get_mut(&id) {
+                Some(grafts) => match grafts.peers.iter_mut().find(|(p, _)| *p == peer) {
+                    Some((_, known)) => *known = (*known).min(round),
+                    None => grafts.peers.push((peer, round)),
+                },
+                None => {
+                    let grafts = Grafts {
+                        peers: vec![(peer, round)],
+                        first: None,
+                        kept: None,
+                    };
+                    let expires = now + self.config.message_cache_retention;
+                    self.grafted.insert(id, grafts, expires);
+                }
+            }
             let message = Message::Graft(Graft {
                 id: Some(id),
                 round,
@@ -769,11 +934,87 @@ impl<PI: PeerIdentity> State<PI> {
         // The dispatch timer would otherwise send these, and the network layer
         // would dial the peer to deliver them.
         self.lazy_push_queue.remove(&peer);
+        self.dropped.remove(&peer);
+        // A peer that comes back has lost its state, so it needs our pushes again.
+        for grafts in self.grafted.values_mut() {
+            grafts.peers.retain(|(grafted, _)| *grafted != peer);
+        }
+    }
+
+    /// Notes a dropped push or announcement, to announce it to the peer later.
+    ///
+    /// A dropped neighbor message is lost, as we do not cache it.
+    fn on_send_dropped(&mut self, peer: PI, message: Message, io: &mut impl IO<PI>) {
+        if !self.eager_push_peers.contains(&peer) && !self.lazy_push_peers.contains(&peer) {
+            return;
+        }
+        let ihaves = match message {
+            Message::Gossip(gossip) => match gossip.round() {
+                Some(round) => vec![IHave {
+                    id: gossip.id,
+                    round,
+                }],
+                None => return,
+            },
+            Message::IHave(ihaves) => ihaves,
+            Message::Prune | Message::Graft(_) => return,
+        };
+        let mut total: usize = self.dropped.values().map(IndexMap::len).sum();
+        let ids = self.dropped.entry(peer).or_default();
+        for IHave { id, round } in ihaves {
+            if !self.cache.contains_key(&id) || ids.contains_key(&id) {
+                continue;
+            }
+            // Past the caps, the peer misses the message unless another peer has it.
+            if ids.len() >= MAX_DROPPED_PER_PEER || total >= MAX_DROPPED {
+                debug!("too many dropped messages to announce again, drop {id}");
+                continue;
+            }
+            ids.insert(id, round);
+            total += 1;
+        }
+        if ids.is_empty() {
+            self.dropped.remove(&peer);
+        }
+        self.schedule_announce_dropped(io);
+    }
+
+    fn schedule_announce_dropped(&mut self, io: &mut impl IO<PI>) {
+        if !self.dropped.is_empty() && !self.announce_dropped_scheduled {
+            io.push(OutEvent::ScheduleTimer(
+                ANNOUNCE_DROPPED_INTERVAL,
+                Timer::AnnounceDropped,
+            ));
+            self.announce_dropped_scheduled = true;
+        }
+    }
+
+    /// Announces the oldest dropped messages per peer, so that one tick sends a bounded amount.
+    fn on_announce_dropped_timer(&mut self, io: &mut impl IO<PI>) {
+        self.announce_dropped_scheduled = false;
+        for (peer, ids) in self.dropped.iter_mut() {
+            // A peer cannot graft what we no longer cache.
+            ids.retain(|id, _round| self.cache.contains_key(id));
+            let ihaves = ids
+                .drain(..ids.len().min(DROPPED_PER_TICK))
+                .map(|(id, round)| IHave { id, round });
+            self.lazy_push_queue
+                .entry(*peer)
+                .or_default()
+                .extend(ihaves);
+        }
+        self.dropped.retain(|_, ids| !ids.is_empty());
+        self.lazy_push_queue.retain(|_, ihaves| !ihaves.is_empty());
+        if !self.lazy_push_queue.is_empty() {
+            self.schedule_dispatch(io);
+        }
+        self.schedule_announce_dropped(io);
     }
 
     fn on_evict_cache_timer(&mut self, now: Instant, io: &mut impl IO<PI>) {
         self.cache.expire_until(now);
         self.received_messages.expire_until(now);
+        self.grafted.expire_until(now);
         io.push(OutEvent::ScheduleTimer(
             self.config.cache_evict_interval,
             Timer::EvictCache,
@@ -793,11 +1034,11 @@ impl<PI: PeerIdentity> State<PI> {
     }
 
     /// Immediately sends message to eager peers.
-    fn eager_push(&mut self, gossip: Gossip, sender: &PI, io: &mut impl IO<PI>) {
+    fn eager_push(&self, gossip: &Gossip, sender: &PI, skip: &[PI], io: &mut impl IO<PI>) {
         for peer in self
             .eager_push_peers
             .iter()
-            .filter(|peer| **peer != self.me && *peer != sender)
+            .filter(|peer| **peer != self.me && *peer != sender && !skip.contains(peer))
         {
             io.push(OutEvent::SendMessage(
                 *peer,
@@ -808,7 +1049,7 @@ impl<PI: PeerIdentity> State<PI> {
 
     /// Queue lazy message announcements into the queue that will be sent out as batched
     /// [`Message::IHave`] messages once the [`Timer::DispatchLazyPush`] timer is triggered.
-    fn lazy_push(&mut self, gossip: Gossip, sender: &PI, io: &mut impl IO<PI>) {
+    fn lazy_push(&mut self, gossip: &Gossip, sender: &PI, io: &mut impl IO<PI>) {
         let Some(round) = gossip.round() else {
             return;
         };
@@ -818,6 +1059,10 @@ impl<PI: PeerIdentity> State<PI> {
                 round,
             });
         }
+        self.schedule_dispatch(io);
+    }
+
+    fn schedule_dispatch(&mut self, io: &mut impl IO<PI>) {
         if !self.dispatch_timer_scheduled {
             io.push(OutEvent::ScheduleTimer(
                 self.config.dispatch_timeout,
@@ -973,6 +1218,204 @@ mod test {
         );
     }
 
+    /// Returns the Plumtree messages in `io` to `peer`.
+    fn sent_to(io: &VecDeque<topic::OutEvent<u32>>, peer: u32) -> Vec<Message> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::OutEvent::SendMessage(to, topic::Message::Gossip(message))
+                    if *to == peer =>
+                {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns the push to `peer` that `io` contains.
+    fn pushed_to(io: &VecDeque<topic::OutEvent<u32>>, peer: u32) -> Option<Message> {
+        sent_to(io, peer)
+            .into_iter()
+            .find(|message| matches!(message, Message::Gossip(_)))
+    }
+
+    /// Returns the ids that `io` announces to `peer`.
+    fn announced_to(io: &VecDeque<topic::OutEvent<u32>>, peer: u32) -> Vec<MessageId> {
+        sent_to(io, peer)
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::IHave(ihaves) => Some(ihaves),
+                _ => None,
+            })
+            .flatten()
+            .map(|ihave| ihave.id)
+            .collect()
+    }
+
+    /// Runs the timers that announce dropped messages, and returns the ids announced to `peer`.
+    fn tick(state: &mut State<u32>, now: Instant, peer: u32) -> Vec<MessageId> {
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::AnnounceDropped), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        announced_to(&io, peer)
+    }
+
+    /// Returns whether `io` schedules a [`Timer::AnnounceDropped`].
+    fn schedules_announce(io: &VecDeque<topic::OutEvent<u32>>) -> bool {
+        io.iter().any(|event| {
+            matches!(
+                event,
+                topic::OutEvent::ScheduleTimer(_, topic::Timer::Gossip(Timer::AnnounceDropped))
+            )
+        })
+    }
+
+    /// Returns a state with neighbor 2, and the push to 2 of a broadcast of `content`.
+    fn broadcast_to_2(content: &[u8], scope: Scope) -> (State<u32>, Message) {
+        let mut io = VecDeque::new();
+        let mut state = State::new(1u32, Config::default(), 1024);
+        state.handle(InEvent::NeighborUp(2), Instant::now(), &mut io);
+        let content = Bytes::copy_from_slice(content);
+        state.handle(InEvent::Broadcast(content, scope), Instant::now(), &mut io);
+        let push = pushed_to(&io, 2).expect("an eager push to 2");
+        (state, push)
+    }
+
+    /// A push that the full queue to a peer dropped is announced to it with the next timer.
+    ///
+    /// The peer then requests it with a graft, as from any lazy peer. Not at
+    /// once: a graft reply that the queue drops again would loop.
+    #[test]
+    fn dropped_push_is_announced_later() {
+        let (mut state, push) = broadcast_to_2(b"dropped", Scope::Swarm);
+        let id = MessageId::from_content(b"dropped");
+        let now = Instant::now();
+        let mut io = VecDeque::new();
+        state.handle(InEvent::SendDropped(2, push), now, &mut io);
+        assert!(schedules_announce(&io), "no timer for the dropped push");
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        assert!(announced_to(&io, 2).is_empty(), "announced at once");
+
+        assert_eq!(tick(&mut state, now, 2), vec![id]);
+        assert!(
+            !state.announce_dropped_scheduled,
+            "the timer runs on with nothing to announce"
+        );
+        // An announcement that went out is not repeated.
+        assert!(tick(&mut state, now, 2).is_empty(), "announced twice");
+
+        // A graft for it gets the payload from the cache.
+        let mut io = VecDeque::new();
+        let graft = Message::Graft(Graft {
+            id: Some(id),
+            round: Round(1),
+        });
+        state.handle(InEvent::RecvMessage(2, graft), now, &mut io);
+        let reply = pushed_to(&io, 2).expect("the graft got no payload");
+
+        // A dropped graft reply is announced again on the next tick, not at once.
+        let mut io = VecDeque::new();
+        state.handle(InEvent::SendDropped(2, reply), now, &mut io);
+        state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
+        assert!(announced_to(&io, 2).is_empty(), "announced at once");
+        assert_eq!(tick(&mut state, now, 2), vec![id]);
+    }
+
+    /// A dropped announcement goes out again with the next `Timer::AnnounceDropped`.
+    #[test]
+    fn dropped_announcement_is_announced_again() {
+        let (mut state, push) = broadcast_to_2(b"dropped", Scope::Swarm);
+        let Message::Gossip(gossip) = push else {
+            unreachable!("a push");
+        };
+        let ihave = Message::IHave(vec![IHave {
+            id: gossip.id,
+            round: Round(0),
+        }]);
+        let now = Instant::now();
+        state.handle(InEvent::SendDropped(2, ihave), now, &mut VecDeque::new());
+        assert_eq!(tick(&mut state, now, 2), vec![gossip.id]);
+    }
+
+    /// A dropped neighbor message is lost, as we do not cache it.
+    #[test]
+    fn dropped_neighbor_message_is_not_announced() {
+        let (mut state, push) = broadcast_to_2(b"dropped", Scope::Neighbors);
+        let now = Instant::now();
+        state.handle(InEvent::SendDropped(2, push), now, &mut VecDeque::new());
+        assert!(tick(&mut state, now, 2).is_empty());
+    }
+
+    /// A dropped push to a peer that went down, or that we no longer cache, is not announced.
+    #[test]
+    fn dropped_push_to_a_gone_peer_is_not_announced() {
+        let mut io = VecDeque::new();
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let now = Instant::now();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        state.handle(
+            InEvent::Broadcast(b"dropped".to_vec().into(), Scope::Swarm),
+            now,
+            &mut io,
+        );
+        let to_2 = pushed_to(&io, 2).expect("an eager push to 2");
+        let to_3 = pushed_to(&io, 3).expect("an eager push to 3");
+        state.handle(InEvent::SendDropped(2, to_2), now, &mut io);
+        state.handle(InEvent::SendDropped(3, to_3), now, &mut io);
+        state.handle(InEvent::NeighborDown(2), now, &mut io);
+
+        let later = now + Config::default().message_cache_retention * 2;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), later, &mut io);
+        state.handle(
+            InEvent::TimerExpired(Timer::AnnounceDropped),
+            later,
+            &mut io,
+        );
+        state.handle(
+            InEvent::TimerExpired(Timer::DispatchLazyPush),
+            later,
+            &mut io,
+        );
+        assert!(announced_to(&io, 2).is_empty(), "announced to a gone peer");
+        assert!(
+            announced_to(&io, 3).is_empty(),
+            "announced a message we no longer cache"
+        );
+    }
+
+    /// Repeated drops of a message take one entry, and the entries per peer and per tick have caps.
+    #[test]
+    fn dropped_messages_have_caps() {
+        let mut io = VecDeque::new();
+        let mut state = State::new(1u32, Config::default(), 1 << 20);
+        let now = Instant::now();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        let mut pushes = Vec::new();
+        for i in 0..MAX_DROPPED_PER_PEER + 10 {
+            let mut io = VecDeque::new();
+            let content = Bytes::from(i.to_be_bytes().to_vec());
+            state.handle(InEvent::Broadcast(content, Scope::Swarm), now, &mut io);
+            pushes.push(pushed_to(&io, 2).expect("an eager push to 2"));
+        }
+        for push in pushes.iter().chain(pushes.iter()) {
+            state.handle(InEvent::SendDropped(2, push.clone()), now, &mut io);
+        }
+        assert_eq!(state.dropped[&2].len(), MAX_DROPPED_PER_PEER);
+
+        let mut announced = 0;
+        loop {
+            let ids = tick(&mut state, now, 2);
+            if ids.is_empty() {
+                break;
+            }
+            assert!(ids.len() <= DROPPED_PER_TICK, "{} in one tick", ids.len());
+            announced += ids.len();
+        }
+        assert_eq!(announced, MAX_DROPPED_PER_PEER);
+    }
+
     /// Announcements queued for a neighbor that then goes down must not be sent.
     #[test]
     fn neighbor_down_drops_queued_ihaves() {
@@ -993,6 +1436,341 @@ mod test {
         state.handle(InEvent::TimerExpired(Timer::DispatchLazyPush), now, &mut io);
 
         assert!(io.is_empty(), "sent to a peer that went down: {io:?}");
+    }
+
+    /// Returns an `IHave` of `id` after `round` hops.
+    fn ihave(id: MessageId, round: u16) -> Message {
+        Message::IHave(vec![IHave {
+            id,
+            round: Round(round),
+        }])
+    }
+
+    /// Adds the lazy peer `peer`, which announces `id` after `round` hops.
+    fn announce(state: &mut State<u32>, peer: u32, id: MessageId, round: u16, now: Instant) {
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(peer), now, &mut io);
+        state.handle(InEvent::RecvMessage(peer, Message::Prune), now, &mut io);
+        state.handle(InEvent::RecvMessage(peer, ihave(id, round)), now, &mut io);
+    }
+
+    /// Returns node 1 with the eager peer 2, and the peer 3 that it grafted for `id`.
+    ///
+    /// Peer 3 was lazy and announced the message after `round` hops.
+    fn grafted_state(id: MessageId, round: u16, now: Instant) -> State<u32> {
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(2), now, &mut io);
+        announce(&mut state, 3, id, round, now);
+        state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
+        assert!(matches!(sent_to(&io, 3)[..], [Message::Graft(_)]));
+        state
+    }
+
+    /// A grafted peer whose late copy took no more hops replaces the peer of the eager copy.
+    ///
+    /// The graft fired while the eager copy still traveled a slower path. If
+    /// the duplicate pruned the grafted peer, the graft and the prune would
+    /// repeat for each message.
+    #[test]
+    fn late_graft_reply_over_no_more_hops_replaces_the_eager_peer() {
+        let now = Instant::now();
+        for hops in [1, 6] {
+            let slow = gossip(b"shortcut", 6);
+            let mut state = grafted_state(slow.id, hops, now);
+            let mut io = VecDeque::new();
+            state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+            assert!(
+                sent_to(&io, 3).is_empty(),
+                "pushed the payload to the peer that announced it"
+            );
+
+            io.clear();
+            let fast = gossip(b"shortcut", hops);
+            state.handle(InEvent::RecvMessage(3, Message::Gossip(fast)), now, &mut io);
+            assert_eq!(sent_to(&io, 2), vec![Message::Prune], "hops {hops}");
+            assert!(sent_to(&io, 3).is_empty());
+            assert!(state.eager_push_peers.contains(&3));
+            assert!(state.lazy_push_peers.contains(&2));
+            state.check_invariants();
+        }
+    }
+
+    /// A grafted peer whose late copy took more hops is pruned, as any duplicate.
+    #[test]
+    fn late_graft_reply_over_a_longer_path_is_pruned() {
+        let now = Instant::now();
+        let first = gossip(b"detour", 2);
+        let mut state = grafted_state(first.id, 5, now);
+        let mut io = VecDeque::new();
+        state.handle(
+            InEvent::RecvMessage(2, Message::Gossip(first)),
+            now,
+            &mut io,
+        );
+        io.clear();
+        let late = gossip(b"detour", 5);
+        state.handle(InEvent::RecvMessage(3, Message::Gossip(late)), now, &mut io);
+        assert_eq!(sent_to(&io, 3), vec![Message::Prune]);
+        assert!(sent_to(&io, 2).is_empty());
+        assert!(state.eager_push_peers.contains(&2));
+        assert!(state.lazy_push_peers.contains(&3));
+    }
+
+    /// Only the first late copy of a grafted peer replaces the eager peer.
+    ///
+    /// A second grafted peer, asked after the second graft timeout, is pruned
+    /// as any duplicate, so a node keeps one eager peer for the path.
+    #[test]
+    fn second_late_graft_reply_is_pruned() {
+        let now = Instant::now();
+        let slow = gossip(b"twice", 6);
+        let mut state = grafted_state(slow.id, 1, now);
+        announce(&mut state, 4, slow.id, 2, now);
+        let mut io = VecDeque::new();
+        state.handle(
+            InEvent::TimerExpired(Timer::SendGraft(slow.id)),
+            now,
+            &mut io,
+        );
+        assert!(state.eager_push_peers.contains(&4), "no second graft");
+
+        state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+        let fast = gossip(b"twice", 1);
+        state.handle(InEvent::RecvMessage(3, Message::Gossip(fast)), now, &mut io);
+        io.clear();
+        let second = gossip(b"twice", 2);
+        state.handle(
+            InEvent::RecvMessage(4, Message::Gossip(second)),
+            now,
+            &mut io,
+        );
+        assert_eq!(sent_to(&io, 4), vec![Message::Prune]);
+        assert!(state.eager_push_peers.contains(&3));
+        assert!(state.lazy_push_peers.contains(&2) && state.lazy_push_peers.contains(&4));
+    }
+
+    /// Of two graft replies before any eager copy, the node prunes the later one.
+    ///
+    /// No eager copy was late, so the rule for late graft replies does not apply.
+    #[test]
+    fn later_of_two_graft_replies_is_pruned() {
+        let now = Instant::now();
+        let id = gossip(b"two replies", 1).id;
+        let mut state = grafted_state(id, 1, now);
+        announce(&mut state, 4, id, 1, now);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
+        let reply = gossip(b"two replies", 1);
+        state.handle(
+            InEvent::RecvMessage(3, Message::Gossip(reply.clone())),
+            now,
+            &mut io,
+        );
+        io.clear();
+        state.handle(
+            InEvent::RecvMessage(4, Message::Gossip(reply)),
+            now,
+            &mut io,
+        );
+        assert_eq!(sent_to(&io, 4), vec![Message::Prune]);
+        assert!(sent_to(&io, 3).is_empty());
+        assert!(state.eager_push_peers.contains(&3));
+        assert!(state.lazy_push_peers.contains(&4));
+    }
+
+    /// A peer that announced a message twice before the graft timer gets one graft.
+    #[test]
+    fn peer_announced_twice_before_the_graft_gets_one() {
+        let now = Instant::now();
+        let id = gossip(b"announced twice", 1).id;
+        let mut state = State::new(1u32, Config::default(), 1024);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        state.handle(InEvent::RecvMessage(3, Message::Prune), now, &mut io);
+        let ihave = ihave(id, 1);
+        state.handle(InEvent::RecvMessage(3, ihave.clone()), now, &mut io);
+        state.handle(InEvent::RecvMessage(3, ihave), now, &mut io);
+        io.clear();
+        for _ in 0..2 {
+            state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
+        }
+        assert_eq!(sent_to(&io, 3).len(), 1, "grafts: {:?}", sent_to(&io, 3));
+    }
+
+    /// A kept peer that answers a retried graft stays eager.
+    ///
+    /// The second reply is our own retry, not a redundant path. If it pruned
+    /// the peer, the node would lose both the eager peer and the kept one.
+    #[test]
+    fn retried_reply_of_a_kept_peer_is_ignored() {
+        let now = Instant::now();
+        let slow = gossip(b"retried", 6);
+        let mut state = grafted_state(slow.id, 1, now);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::RecvMessage(3, ihave(slow.id, 1)), now, &mut io);
+        io.clear();
+        state.handle(
+            InEvent::TimerExpired(Timer::SendGraft(slow.id)),
+            now,
+            &mut io,
+        );
+        assert!(
+            matches!(sent_to(&io, 3)[..], [Message::Graft(_)]),
+            "no retry"
+        );
+
+        state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+        let fast = gossip(b"retried", 1);
+        state.handle(
+            InEvent::RecvMessage(3, Message::Gossip(fast.clone())),
+            now,
+            &mut io,
+        );
+        io.clear();
+        state.handle(InEvent::RecvMessage(3, Message::Gossip(fast)), now, &mut io);
+        assert!(sent_to(&io, 3).is_empty(), "pruned the kept peer");
+        assert!(state.eager_push_peers.contains(&3));
+        assert!(state.lazy_push_peers.contains(&2));
+    }
+
+    /// A message whose graft replies the source's queue drops reaches the receiver once it clears.
+    ///
+    /// The source announces the message again after each drop, and the
+    /// receiver grafts it again. A second reply, as when a retry crosses a
+    /// reply, prunes nothing.
+    /// With two peers, no other source can hide a missing retry.
+    #[test]
+    fn dropped_graft_replies_are_requested_again() {
+        let now = Instant::now();
+        let (mut source, push) = broadcast_to_2(b"dropped replies", Scope::Swarm);
+        let mut receiver = State::new(2u32, Config::default(), 1024);
+        receiver.handle(InEvent::NeighborUp(1), now, &mut VecDeque::new());
+        source.handle(InEvent::SendDropped(2, push), now, &mut VecDeque::new());
+        let mut reply = None;
+        for attempt in 0..3 {
+            let id = tick(&mut source, now, 2);
+            assert_eq!(id.len(), 1, "attempt {attempt}: no announcement");
+            let ihave = Message::IHave(vec![IHave {
+                id: id[0],
+                round: Round(0),
+            }]);
+            receiver.handle(InEvent::RecvMessage(1, ihave), now, &mut VecDeque::new());
+            let mut io = VecDeque::new();
+            receiver.handle(InEvent::TimerExpired(Timer::SendGraft(id[0])), now, &mut io);
+            let graft = sent_to(&io, 1).pop().expect("a graft");
+            assert!(
+                matches!(graft, Message::Graft(_)),
+                "attempt {attempt}: no graft"
+            );
+            let mut io = VecDeque::new();
+            source.handle(InEvent::RecvMessage(2, graft), now, &mut io);
+            let answer = pushed_to(&io, 2).expect("a reply");
+            if attempt < 2 {
+                source.handle(
+                    InEvent::SendDropped(2, answer.clone()),
+                    now,
+                    &mut VecDeque::new(),
+                );
+                reply = Some(answer);
+            } else {
+                let mut io = VecDeque::new();
+                receiver.handle(InEvent::RecvMessage(1, answer), now, &mut io);
+                let received = io
+                    .iter()
+                    .filter(|event| matches!(event, topic::OutEvent::EmitEvent(_)))
+                    .count();
+                assert_eq!(received, 1);
+            }
+        }
+        // A second reply to the same peer's grafts.
+        let mut io = VecDeque::new();
+        receiver.handle(
+            InEvent::RecvMessage(1, reply.expect("a dropped reply")),
+            now,
+            &mut io,
+        );
+        assert!(io.is_empty(), "late reply caused {io:?}");
+        assert!(receiver.eager_push_peers.contains(&1));
+    }
+
+    /// While a graft for a message is out, the eager copy does not optimize the tree.
+    ///
+    /// The tree optimization would only see the announcements left after the
+    /// graft. Here it would graft peer 4 and prune peer 2, and the reply of
+    /// the grafted peer 3 would then find no eager peer to replace.
+    #[test]
+    fn graft_reply_decides_before_the_tree_optimization() {
+        let now = Instant::now();
+        let slow = gossip(b"optimize", 9);
+        let mut state = grafted_state(slow.id, 1, now);
+        announce(&mut state, 4, slow.id, 2, now);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+        assert!(sent_to(&io, 4).is_empty(), "optimized the tree");
+        let fast = gossip(b"optimize", 1);
+        state.handle(InEvent::RecvMessage(3, Message::Gossip(fast)), now, &mut io);
+        assert_eq!(state.eager_push_peers, BTreeSet::from([3]));
+        assert!(state.lazy_push_peers.contains(&2) && state.lazy_push_peers.contains(&4));
+    }
+
+    /// A graft whose reply cannot change the tree does not stop the tree optimization.
+    ///
+    /// Peer 3 announced over more hops than the eager copy took, so its reply
+    /// gets pruned. The optimization still grafts peer 4, which announced over
+    /// far fewer hops. Else no rule would ever pick peer 4.
+    #[test]
+    fn slow_graft_does_not_stop_the_tree_optimization() {
+        let now = Instant::now();
+        let slow = gossip(b"slow graft", 8);
+        let mut state = grafted_state(slow.id, 9, now);
+        announce(&mut state, 4, slow.id, 1, now);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+        assert!(
+            matches!(sent_to(&io, 4)[..], [Message::Graft(_)]),
+            "no optimization"
+        );
+        assert_eq!(sent_to(&io, 2), vec![Message::Prune]);
+    }
+
+    /// A grafted peer that went down does not hold back the tree optimization.
+    ///
+    /// Its reply cannot come any more, so only the other announcers count.
+    #[test]
+    fn gone_grafted_peer_does_not_stop_the_tree_optimization() {
+        let now = Instant::now();
+        let slow = gossip(b"gone graft", 9);
+        let mut state = grafted_state(slow.id, 1, now);
+        announce(&mut state, 4, slow.id, 2, now);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborDown(3), now, &mut io);
+        io.clear();
+        state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+        assert!(
+            matches!(sent_to(&io, 4)[..], [Message::Graft(_)]),
+            "no optimization"
+        );
+        assert_eq!(sent_to(&io, 2), vec![Message::Prune]);
+    }
+
+    /// A grafted peer that went down and came back gets the push of the eager copy.
+    ///
+    /// It lost its state, so it may not have the message any more.
+    #[test]
+    fn reconnected_grafted_peer_gets_the_push() {
+        let now = Instant::now();
+        let slow = gossip(b"reconnected", 6);
+        let mut state = grafted_state(slow.id, 1, now);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::NeighborDown(3), now, &mut io);
+        state.handle(InEvent::NeighborUp(3), now, &mut io);
+        io.clear();
+        state.handle(InEvent::RecvMessage(2, Message::Gossip(slow)), now, &mut io);
+        assert!(
+            pushed_to(&io, 3).is_some(),
+            "no push to the reconnected peer"
+        );
     }
 
     /// A message that missed the eager path reaches us through an `IHave` and a `Graft`.
@@ -1021,10 +1799,7 @@ mod test {
         let mut io = VecDeque::new();
         receiver.handle(InEvent::NeighborUp(2), now, &mut io);
         receiver.handle(InEvent::RecvMessage(2, Message::Prune), now, &mut io);
-        let ihave = Message::IHave(vec![IHave {
-            id,
-            round: Round(1),
-        }]);
+        let ihave = ihave(id, 1);
         receiver.handle(InEvent::RecvMessage(2, ihave), now, &mut io);
         io.clear();
         receiver.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
@@ -1079,13 +1854,7 @@ mod test {
         // two hops away from the original sender of the message
         let content: Bytes = b"hi".to_vec().into();
         let id = MessageId::from_content(&content);
-        let event = InEvent::RecvMessage(
-            2u32,
-            Message::IHave(vec![IHave {
-                id,
-                round: Round(2),
-            }]),
-        );
+        let event = InEvent::RecvMessage(2u32, ihave(id, 2));
         state.handle(event, now, &mut io);
         io.clear();
         // we then receive a `Gossip` message with the same `MessageId` from peer 3
@@ -1125,13 +1894,7 @@ mod test {
 
         let content: Bytes = b"hi2".to_vec().into();
         let id = MessageId::from_content(&content);
-        let event = InEvent::RecvMessage(
-            2u32,
-            Message::IHave(vec![IHave {
-                id,
-                round: Round(2),
-            }]),
-        );
+        let event = InEvent::RecvMessage(2u32, ihave(id, 2));
         state.handle(event, now, &mut io);
         io.clear();
 
@@ -1245,11 +2008,7 @@ mod test {
         let now = Instant::now();
         state.handle(InEvent::NeighborUp(2), now, &mut io);
         let id = MessageId::from_content(b"hi");
-        let ihave = Message::IHave(vec![IHave {
-            id,
-            round: Round(1),
-        }]);
-        state.handle(InEvent::RecvMessage(2, ihave), now, &mut io);
+        state.handle(InEvent::RecvMessage(2, ihave(id, 1)), now, &mut io);
 
         state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
 
