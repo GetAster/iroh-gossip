@@ -587,15 +587,34 @@ fn hyparview_peer_rejoins_after_an_outage_when_its_bootstrap_peer_is_gone() {
 #[test]
 fn hyparview_heals_without_waiting_for_a_shuffle() {
     let peers = swarm_size(PEERS);
-    /// One-way link latencies allowed until the overlay is whole again.
+    let network = NetworkConfig::from(Config::default());
+    /// One-way link latencies the promotions themselves take.
     ///
-    /// Measured over 50 seeds: at most 5 after 10 percent failure, at most 10
-    /// after 50 percent.
-    const MAX_LATENCIES: usize = 20;
+    /// Measured over 300 seeds, without the seeds that wait for a timeout: at
+    /// most 11 after 10 percent failure, and p99 16 after 50 percent.
+    const HEALING_LATENCIES: usize = 20;
+    // A neighbor request to a failed peer only ends by its timeout: the sim
+    // drops messages to a removed peer, so no dial error ends it sooner. A
+    // survivor in recovery whose outstanding requests went to failed peers,
+    // after its live passive peers refused it, therefore heals one timeout
+    // later, not after a shuffle. That happens on about 1 seed in 300 at 50
+    // percent failure. The bound adds one timeout, counted in the max-latency
+    // steps `latencies_until_whole` runs. The first shuffle is still far
+    // outside it (see the assertion below), so only promotion can heal the
+    // overlay in time.
+    let latency = network.latency.max();
+    let timeout = network.proto.membership.neighbor_request_timeout;
+    let max_latencies =
+        HEALING_LATENCIES + timeout.as_nanos().div_ceil(latency.as_nanos()) as usize;
+    let shuffle = network.proto.membership.shuffle_interval;
+    assert!(
+        latency * (max_latencies as u32) < shuffle,
+        "the healing window reaches the shuffle interval"
+    );
 
     for fraction in [10, 50] {
         for seed in seeds() {
-            let mut sim = swarm(peers, seed);
+            let mut sim = swarm_with(peers, seed, network.clone());
             let before: BTreeMap<u64, Vec<u64>> = sim
                 .network
                 .peer_ids()
@@ -613,15 +632,15 @@ fn hyparview_heals_without_waiting_for_a_shuffle() {
                 "seed {seed}, {fraction}% failure: no survivor lost a neighbor"
             );
 
-            let latencies = latencies_until_whole(&mut sim, MAX_LATENCIES);
+            let latencies = latencies_until_whole(&mut sim, max_latencies);
             report(
                 &format!("hyparview: healing after {fraction}%"),
                 seed,
                 format!("{damaged} damaged peers whole again after {latencies} latencies"),
             );
             assert!(
-                latencies < MAX_LATENCIES,
-                "seed {seed}, {fraction}% failure: overlay still broken after {MAX_LATENCIES} latencies"
+                latencies < max_latencies,
+                "seed {seed}, {fraction}% failure: overlay still broken after {max_latencies} latencies"
             );
             assert_eq!(
                 broadcast(&mut sim).missed,
