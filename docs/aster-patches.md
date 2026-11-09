@@ -14,26 +14,26 @@ This repository is Aster's fork of [n0-computer/iroh-gossip](https://github.com/
 
 Historical and current tag schemes in this repository:
 
-- `aster-iroh-gossip-v<version>`, for example `aster-iroh-gossip-v0.99.0`, `aster-iroh-gossip-v0.100.0`, `aster-iroh-gossip-v0.101.1`, `aster-iroh-gossip-v0.101.1002`.
+- `aster-iroh-gossip-v<version>`, for example `aster-iroh-gossip-v0.99.0`, `aster-iroh-gossip-v0.100.0`, `aster-iroh-gossip-v0.101.1`, `aster-iroh-gossip-v0.101.1002`, `aster-iroh-gossip-v0.102.1001`.
 - `aster-iroh-gossip-v<version>-p<n>`, a later commit at the same crate version: `aster-iroh-gossip-v0.101.0-p1`, `-v0.101.0-p2`, `-v0.101.1-p1`, `-v0.101.1-p2`, `-v0.101.1-p3` and `-v0.101.1-p4` (patch-block re-pins with no source change).
 
 ## Current release
 
 | Field | Value |
 |---|---|
-| Upstream base | `v0.101.0` |
-| Integration branch | `upgrade/iroh-gossip-v0.101` (a historical per-minor name; the next upstream base gets `upgrade/iroh-gossip-v<upstream version>`) |
-| Tag | `aster-iroh-gossip-v0.101.1003` |
-| Pinned commit | `4e2806907272633748c5bee45c6f4e263cd94f88` |
-| Crate version | 0.101.1003 (workspace spec `iroh-gossip = "0.101.1003"`) |
+| Upstream base | `v0.102.0` (`a16f016c`) |
+| Integration branch | `upgrade/iroh-gossip-v0.102.0` |
+| Tag | `aster-iroh-gossip-v0.102.1001` |
+| Pinned commit | `39a2ed2c8b5e99d2fb49f887e9589804cd441c82` |
+| Crate version | 0.102.1001 (workspace spec `iroh-gossip = "0.102.1001"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-gossip.git` |
 
-The fork's own `[patch.crates-io]` (row 17) pins iroh `9ba1447d` (1.4.2002) and noq `379f73677c` (1.4.1001), the stack Aster links it against (unchanged from 0.101.1-p7). The crate code is 0.101.1002: the version was bumped at `d2e14fb3` after rows 55 and 56 landed, and the wave's later commits (rows 55/56 follow-ups and row 58) landed before the first tag of 0.101.1002, which points at the pinned commit; nothing at `d2e14fb3` was tagged or published. `-p1` to `-p7` (0.101.1) change only the patch block and lock.
+The fork's own `[patch.crates-io]` (row 17) pins iroh `9ba1447d` (1.4.2002) and noq `379f73677c` (1.4.1001), the stack Aster links it against, unchanged from 0.101.1003. Upstream v0.102.0 contains every upstream fix rows 29 and 58 backported and the fixes rows 55 and 56 made locally, so the stack is now row 17, row 83 (re-cut), rows 84 and 85 (new) and the `.gitignore` line; see the 2026-11-09 History entry.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "4e2806907272633748c5bee45c6f4e263cd94f88" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "39a2ed2c8b5e99d2fb49f887e9589804cd441c82" }
 ```
 
 ## Patches
@@ -42,24 +42,31 @@ Row numbers are stable patch ids shared across Aster's iroh-family forks (iroh, 
 
 | Id | Topic branch | What | Why / what in Aster depends on it | Commits (topic / upgrade) | Status | Conflict or porting notes |
 |---|---|---|---|---|---|---|
-| 17 | none recorded (original commit `14a76d5`) | `[patch.crates-io]` block pointing the iroh/noq crates at the Aster forks. File: `Cargo.toml`. | Keeps gossip builds on the Aster fork stack and avoids mixing crates.io iroh-base/noq with forked iroh. | `14a76d5` (original); rc.1 copy `511613f`; re-pinned since, latest in `c3dea9a3` (0.101.1-p7) | carried | Low conflict risk. Pin explicit fork revs or tags, and re-check comments and direct dependency versions after each upstream release. In the 1.0 port it hit a trailing-EOF conflict in `Cargo.toml`. |
-| 29 | `fix/upstream-lifecycle-port` (based on `de100e9`, the 0.101.0-p2 pin, not on the upstream tag) | Ports upstream's unreleased connection and peer lifecycle fixes (upstream `main`, 2026-10-09..14; latest release then v0.101.0). **#161** (fixes #172 and #174): prunes `peer_topics` on disconnect, keeps a peer while another topic still uses it, clears HyParView peer data, answers a `Join` from a peer that is already a neighbour (restart with the same id), and raises the neighbour-request timeout from 500 ms to 3 s. **#178** (fixes #145, #101, #155): a failed dial or a closed connection drops the net actor's peer state, so the next `Join` dials again; unused connections close 5 s after no topic uses them; a write error drops only its stream; a repeated `Gossip::shutdown` returns `Ok`. **#189**: a flags byte after the topic in the stream header; only peers that set it get the close timer, and 0.90–0.101 nodes ignore the trailing byte. **#183**: a cancelled task at runtime shutdown stops the actor without a panic. **#191**: maintenance every 5 s refills below half the active view and rejoins through the last 8 contacts when alone; refill at once after a failed request dial; first shuffle about 1 s after a join; frames from non-neighbours no longer change peer sets; re-exports `Ttl` and `Round`. Files: `Cargo.toml`, `src/net.rs`, `src/net/util.rs`, `src/proto.rs`, `src/proto/{hyparview,plumtree,sim,state,topic}.rs`, `tests/e2e.rs`, `tests/paper.rs`. | The 2026-10-15 Aster restart probe (Aster repository, `docs/_internal/investigations/2026-10-15-restart-reconnect.md`, cause 4): gossip never re-dialled a peer after one failed dial, for every topic including Docs live sync. #178 fixes that. Recovery after a peer restart is still bound by iroh's stale connection (causes 1–2, handled in the iroh and noq forks): the dead connection stays `Active` until the 30 s QUIC idle timeout. | upstream `b89fa98` (#183), `fcd81ae` (#161), `f02f79e` (#178), `cd73d93` (#189), `dfeec14` (#191), cherry-picked `-x` as `b0bbb05`, `e372f13`, `26792b9`, `4099a1b`, `2ce6e82` / the same commits on `upgrade/iroh-gossip-v0.101`; released as 0.101.1 at `aed725d1` | carried | Clean apart from `Cargo.lock` on #183 (upstream's syn/yoke-derive bump; the fork's lock kept). Source equals upstream `main` (`6cbbafa`) except `src/bin/sim.rs` (upstream `f128b98`, clippy-only, not carried). Behaviour changes upstream wants as semver-major: unused connections close after 5 s, and shuffles start about 1 s after a join. Downstream effect: a node whose first gossip dial was refused now joins the swarm once admitted, so HyParView `ForwardJoin` meshes it with the other members (seen in Aster `enrollment_replica_trust`). Upstream known bugs still open: a former instance's `Disconnect` removes its same-id replacement (`known_bug_former_instance_leaving_preserves_replacement`), and #47 (a slow peer blocks the actor; fixed in this fork by row 55). Tests: lib 88, e2e 26, paper 25, sim 4, doc 1; `--no-default-features` lib 54; clippy `--all-features --all-targets -D warnings` and fmt clean. **Drop when a released iroh-gossip containing upstream #161, #172 (fixed by #161), #178, #183, #189 and #191 is pinned.** |
-| 55 | `fix/i-stall-hardening` | The actor's per-peer send (`src/net.rs`) and the recv loop's `in_event_tx` send (`src/net/util.rs`) `try_send` + drop on a full queue instead of awaiting forever, with counters (`send_queue_full_drops`, `in_event_full_drops`) and 10 s rate-limited warns; the per-peer send queue cap is raised 64 → 1024 so ordinary bursts buffer instead of dropping; the in_event dispatch path is made sync. Files: `src/net.rs`, `src/net/util.rs`, `tests/e2e.rs`. | §I bench (`_internal/docs/aster-rpc/261103_i-bench-deadlock.md`): at the QUIC uni-stream credit wall (one uni stream per topic held open, 100/direction) the send loop blocks in `open_uni`/`write_frame`, the 64-cap per-peer queue fills, and the serial actor wedges in the awaited send — one wedged peer took the node's whole gossip down. Drop + warn turns the wall into counted loss + resync instead of a wedge (the owner's regression run: limit 100, fix 2 only → 2922 drops, the bench completes, no wedge). Fixes upstream #47. | `f4f43823` (same on topic and upgrade); `ad84a32b` on the topic, `7f8bbbca` on upgrade (de-async); `a528b006` upgrade-only (cap 1024 + the slow-peer test rewritten for the fixed behaviour) | carried | The slow-peer test diverges from upstream's `known_bug_slow_peer_does_not_block_shutdown` (`#[should_panic]`): ours asserts the flood degrades to counted loss and shutdown completes. |
-| 56 | `fix/i-stall-hardening` | Time-boxes the send loop's `conn.open_uni()` (5 s) with a rate-limited warn naming the topic and an `open_uni_stalls` counter. File: `src/net/util.rs`. | A blocked `open_uni` means the connection is at its uni-stream limit with no stream closing — it pends silently forever (nine instrumented bench runs to find it). Exhaustion must be loud. The cure is Aster's `transport_max_concurrent_uni_streams` default of 1M (Aster core, not this fork). | `6eb304c0` (same on topic and upgrade) | carried | |
-| 58 | none recorded (upstream backport) | Cherry-picks upstream #195 (`5592b477`: a per-peer close flag — a connection on which neither peer ever opens a stream now retires once the peer is known to handle the close, with 20 s flag retention) and takes upstream #187's send side (`6bb9fe07`: an oversized message is dropped and its topic stream kept, instead of reset — the reset lost every later message queued on the stream). Files: `src/net.rs`, `src/net/util.rs`, `tests/e2e.rs`. | #195 fixes the run-varying `open_connections_link_neighbors` failures in the upstream suite — a connection leak plus a false positive in the test's pair-based check — so the suite is deterministic for this wave's release gate. #195's own size-limit tests assume #187's drop-and-keep behaviour. The rest of #187 (API-level refusal: `broadcast` returns `ApiError::TooLarge`, `max_content_size`) is not taken. | upstream `5592b477` (#195), `6bb9fe07` (#187) / upgrade `7b30e0f7`, `602bbb71` | carried | **Drop when a released iroh-gossip containing upstream #195 and #187 is pinned.** |
-| 83 | none recorded (`4e280690`) | Idle topics set no periodic timers. Plumtree arms `EvictCache` only while either message cache holds entries, for the earliest expiry and no sooner than `cache_evict_interval` (it re-armed every second unconditionally). HyParView runs `DoMaintenance` every 5 s while the active view is short and every 60 s (`STABLE_MAINTENANCE_INTERVAL`) otherwise; a view that turns short re-arms the short cadence, and a timer generation (`DoMaintenance(u64)`) keeps a superseded timer from running or re-arming. Files: `src/proto/plumtree.rs`, `src/proto/hyparview.rs`, `src/proto/state.rs`, `src/proto/util.rs`. | portal-sync §V: the gossip actor was 35-47% of idle tokio samples, two timers per topic and about 200 topics per daemon. | `4e280690` | carried | Losing an active peer still refills at once (`remove_active`), so the 60 s backstop only matters for a view that stays short of refills. Tests: `plumtree::test::eviction_timer_runs_only_while_caches_hold_entries`, `hyparview::tests::maintenance_backs_off_while_the_view_is_healthy`. |
+| 17 | none recorded (original commit `14a76d5`) | `[patch.crates-io]` block pointing the iroh/noq crates at the Aster forks. File: `Cargo.toml`. | Keeps gossip builds on the Aster fork stack and avoids mixing crates.io iroh-base/noq with forked iroh. | `14a76d5` (original); rc.1 copy `511613f`; re-pinned since; on `upgrade/iroh-gossip-v0.102.0` as `ceb31220` | carried | Low conflict risk. Pin explicit fork revs or tags, and re-check comments and direct dependency versions after each upstream release. In the 1.0 port it hit a trailing-EOF conflict in `Cargo.toml`. |
+| 83 | `perf/idle-topic-timers-v0.102.0` (tip `24bc7032`, based on `v0.102.0`; the 0.101 commit was `4e280690`) | Idle topics set no periodic timers. Plumtree arms `EvictCache` only while either message cache holds entries, for the earliest expiry and no sooner than `cache_evict_interval` (it re-armed every second unconditionally). HyParView runs `DoMaintenance` every 5 s while the active view is short or a recovery (`RefillLimit::Recovery`) runs, and every 60 s (`STABLE_MAINTENANCE_INTERVAL`) otherwise; a view that turns short re-arms the short cadence, and a timer generation (`DoMaintenance(u64)`) keeps a superseded timer from running or re-arming. Join retry timers (#217) and shuffle timers are unchanged. Files: `src/proto/plumtree.rs`, `src/proto/hyparview.rs`, `src/proto/state.rs`, `src/proto/util.rs`. | portal-sync §V: the gossip actor was 35-47% of idle tokio samples, two timers per topic and about 200 topics per daemon. | `24bc7032` / `7d2e8dfc` (0.101: `4e280690`) | re-cut | Re-cut on upstream #196 (`f2b1f29c`: refill limits and backoff for a short view) and #217 (`5cf0350f`: join retry). New condition in the re-cut: a running recovery also keeps the 5 s cadence, because only a maintenance pass ends a recovery. Losing an active peer still refills at once (`remove_active`), so the 60 s backstop only matters for a view that stays short of refills. Tests: `plumtree::test::eviction_timer_runs_only_while_caches_hold_entries`, `hyparview::tests::maintenance_backs_off_while_the_view_is_healthy`, `hyparview::tests::maintenance_runs_soon_to_end_a_recovery`. It changes the event order of every simulation, so seeded paper and sim outcomes move (row 84). |
+| 84 | `test/paper-heal-window-v0.102.0` (tip `4751c93a`, based on `v0.102.0`) | `tests/paper.rs` `hyparview_heals_without_waiting_for_a_shuffle`: the healing window is the measured 20 max-latency steps plus one `neighbor_request_timeout` in max-latency steps (3 s / 100 ms = 30), both read from the `NetworkConfig` the swarm is built with, and the test asserts the window stays below `shuffle_interval` (60 s). File: `tests/paper.rs`. | The sim drops messages to a removed peer, so a neighbor request to a failed peer ends only by its timeout. A survivor left with one neighbor whose live passive peers refused it (full active views; it asks with low priority) and whose next requests went to failed peers stays in recovery until that timeout, then heals with no shuffle or maintenance pass, after the old 20-step (2 s) window. Over 300 seeds at 50 percent failure with the old window: upstream v0.102.0 fails 1/300 (seed 75: peer 190, active view `[135]` after losing 189, 176 and 68, 10 live passive peers at the failure, recovery with requests outstanding to 112, 109 and 144, whole at 28 steps); the row-83 tree fails 2/300 (seed 1: peer 94, active `[95]` after losing 69 and 116, 14 live passive peers at the failure, 18 refusals, requests outstanding to failed peers 112 and 134, whole at 34 steps; seed 59: peer 180, active `[162]`, whole at 22). Healing is otherwise unchanged by row 83 (50 percent: mean 4.48 vs 4.47 steps, p50 4 on both). With the new window both trees pass all 300 seeds (max 34 and 28). | `4751c93a` / `aa2e7e18` | carried | Replaces the previous port's seed skip (`19b68bcf`/`f8ea553e`, never published), whose explanation, a survivor "whose passive peers all failed", was wrong: every stranded survivor above had live passive peers. Applies to upstream v0.102.0 unchanged. |
+| 85 | none recorded (upgrade-only) | `handle_dial_failed` in `src/net.rs`: `!…is_some_and(has writer)` becomes `…is_none_or(no writer)`. No behaviour change. | Upstream v0.102.0 fails `clippy::nonminimal_bool` on the Rust 1.96 toolchain Aster builds with, so the fork's `clippy -D warnings` gate needs it. | `69afcf4c` | carried | Drop once upstream's code passes clippy on Aster's toolchain. |
 
 Bookkeeping and documentation commits (not needed at runtime):
 
 | Commits | Files | Purpose | Status |
 |---|---|---|---|
-| `d7d1358` (original) / `0bbff98` (rc.1) | `.gitignore` | Ignores local `docs/aster/` internal review docs. | Recorded in the rc.1 stack; current status not recorded. Optional. |
+| `d7d1358` (original) / `0bbff98` (rc.1) / `93ab58e4` (0.101) / `a6a162c3` (0.102, `cherry-pick -x` of `93ab58e4`) | `.gitignore` | Ignores local `docs/aster/` internal review docs. | carried: the owner's checkout keeps untracked review notes there. |
 | `fdecec8` (rc.1) | `Cargo.lock` | Resolves the Aster iroh/noq fork crates. Regenerated each wave. | carried in spirit (regenerated). |
 | `161cec0` | `README.md` | Aster fork overview and contribution table. | Replaced by the `main` README preamble under the current model; if reused, refresh PR statuses. |
 
 ### Upstreamed or dropped
 
-No iroh-gossip patch has been dropped. Row 29 is itself a backport of upstream work that is merged on upstream `main` but unreleased; it becomes `upstreamed` once a release containing it is pinned.
+Absorbed by upstream v0.102.0 (`a16f016c`), dropped in the 2026-11-09 port (0.102.1001). The rows as they stood in 0.101.1003:
+
+| Id | What | Upstream | Notes |
+|---|---|---|---|
+| 29 | Backport of upstream's connection and peer lifecycle fixes (#161, #178, #183, #189, #191). | `fcd81ae8` (#161), `f02f79e8` (#178), `b89fa981` (#183), `cd73d931` (#189), `dfeec141` (#191) | upstreamed: released in v0.102.0. Commits on 0.101: `b0bbb05`, `e372f13`, `26792b9`, `4099a1b`, `2ce6e82`. |
+| 55 | The actor's per-peer send and the recv loop's `in_event_tx` send `try_send` + drop, with `send_queue_full_drops` / `in_event_full_drops` counters; per-peer queue cap 1024. | `dee7a261` (#185) | absorbed in substance: byte-capped per-peer send queues, drops counted by `msgs_dropped` and `peers_send_queue_full`; the actor no longer awaits a per-peer send, so the recv-loop drop is not re-added. Our counter names are gone; nothing in Aster reads them. Fixes upstream #47. Commits on 0.101: `f4f43823`, `7f8bbbca`, `a528b006`. |
+| 56 | Time-boxes `conn.open_uni()` (5 s), with `open_uni_stalls`. | `dee7a261` (#185) | absorbed in effect: upstream opens a stream with a 15 s `OPEN_TIMEOUT` and closes the connection on expiry. The `open_uni_stalls` counter is gone; nothing in Aster reads it. Commit on 0.101: `6eb304c0`. |
+| 58 | Upstream #195 (per-peer close flag) and #187's send side (oversized message dropped, stream kept). | `5592b477` (#195), `6bb9fe07` (#187) | upstreamed: released in v0.102.0, including #187's API-level refusal. Commits on 0.101: `7b30e0f7`, `602bbb71`. |
+
+Also in v0.102.0 and relevant to consumers: #198 (`c5f44db7`) marks `Event`, `Command` and `Metrics` `#[non_exhaustive]` (iroh-docs 0.101.1034 and Aster gained catch-all arms), and #206 (`c156ecbf`) keeps a connection while streams are open.
 
 ### Closed security-review branches
 
@@ -77,14 +84,14 @@ These topic branches came from an April 2026 security review. The fixes from tha
 
 Order across the iroh family: noq, then iroh, then the satellites in the Aster publisher's order: iroh-util, this repository, iroh-blobs, iroh-docs. This fork's `[patch.crates-io]` names iroh and noq by revision, so re-pin it after those move; iroh-docs pins this fork, so it comes after.
 
-Before touching branches, read the upstream changelog and range from the previous base (the rc.1 port reviewed `v0.99.0..v0.100.0`). If the target release contains upstream #161, #178, #183, #189 and #191, drop row 29.
+Before touching branches, read the upstream changelog and range from the previous base (the rc.1 port reviewed `v0.99.0..v0.100.0`; the 0.102 port `v0.101.0..v0.102.0`). Row 83 changes simulation event order, so re-run `PAPER_SEEDS=300 cargo test --features test-utils --test paper` on the port; give each worktree its own `CARGO_TARGET_DIR`, as two worktrees of this crate sharing one target reuse a stale test binary.
 
 ```bash
 git fetch --all --tags --prune
 git push origin <upstream-tag>          # mirror the upstream tag (e.g. v0.102.0) to the forge
 git switch -c upgrade/iroh-gossip-v<upstream version> <upstream-tag>
 # row 17: re-point [patch.crates-io] at the new iroh/noq fork revs, regenerate Cargo.lock, commit
-# row 29: cherry-pick -x only the upstream fixes the release does not yet contain
+# rows 83, 84, 85 and the .gitignore line: cherry-pick -x from their topic branches (re-cut a row whose topic no longer applies)
 # version bump, only if the version rule requires it (Aster's registry has already
 # served <upstream version> or higher in the series): set the crate to the next option E version (`1000 * (upstream_patch + 1) + n`), then
 git commit -am "chore: release <published version>"
@@ -134,7 +141,17 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### Idle timers (2026-11-08), current
+### iroh-family upstream wave (2026-11-09), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.102.0` | `aster-iroh-gossip-v0.102.1001` | `39a2ed2c8b5e99d2fb49f887e9589804cd441c82` | `upgrade/iroh-gossip-v0.102.0` |
+
+- **0.102.1001** (`39a2ed2c`): port onto upstream v0.102.0. Stack: `ceb31220` row 17 (patch block, iroh 1.4.2002 / noq 1.4.1001), `7d2e8dfc` row 83 (re-cut, from `perf/idle-topic-timers-v0.102.0` `24bc7032`), `aa2e7e18` row 84 (from `test/paper-heal-window-v0.102.0` `4751c93a`), `69afcf4c` row 85 (lint), `a6a162c3` `.gitignore` (from `93ab58e4`), `39a2ed2c` version. Rows 29, 55, 56 and 58 dropped as absorbed (see "Upstreamed or dropped"). Option E: upstream patch 0, n = 1. iroh-docs re-pins to it in `aster-iroh-docs-v0.101.1034`.
+- Validation at the pinned commit, 3 runs: `cargo test --locked --all-features` lib 208 (3 ignored), e2e 27, paper 26, sim 4, doc 1, all passed each run; `--no-default-features --lib` 105; clippy `--all-features --all-targets` and `--no-default-features --all-targets` `-D warnings` clean; fmt clean on the files the patches touch. `PAPER_SEEDS=300` for the heal test passes on the port and on upstream v0.102.0 with row 84.
+- A first port of this wave carried a seed skip in the heal test instead of row 84; it was reviewed, replaced, and never pushed.
+
+### Idle timers (2026-11-08)
 
 - **`aster-iroh-gossip-v0.101.1003`** (`4e280690`): row 83 (idle topics set no periodic timers). Lib and integration suites pass (one early full-suite run had a single lib failure that did not reproduce in 3 full runs, 5 lib runs, 6 parallel lib runs and 15 net-test loops). iroh-docs re-pins to it in `aster-iroh-docs-v0.101.1033`.
 
