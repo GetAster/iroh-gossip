@@ -364,6 +364,19 @@ impl<K: Hash + Eq + Clone, V, S: BuildHasher> TimeBoundCache<K, V, S> {
         self.map.len()
     }
 
+    /// Returns `true` if the map contains no elements.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The earliest expiry instant of any entry, if there is one.
+    ///
+    /// It may belong to an entry that was since re-inserted with a later expiry.
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.expiry.first().copied()
+    }
+
     /// Get an item from the cache.
     pub fn get(&self, key: &K) -> Option<&V> {
         self.map.get(key).map(|(_expires, value)| value)
