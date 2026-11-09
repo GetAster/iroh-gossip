@@ -34,6 +34,16 @@ const INITIAL_SHUFFLE_INTERVAL: Duration = Duration::from_secs(1);
 /// it calls "random promotion", every 5s.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Interval of the maintenance pass while the node needs none, see
+/// [`State::wants_short_maintenance`].
+///
+/// A healthy view has nothing to refill: losing an active peer refills at
+/// once (see `remove_active`), so the pass is only a backstop there. The
+/// backoff schedules ([`MAX_BACKOFF_PASSES`]) count passes of the short
+/// [`MAINTENANCE_INTERVAL`] only: the short cadence resumes as soon as the
+/// node needs it, so this interval never stretches them.
+const STABLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Delay before the one retry of a Join requested by the caller.
 ///
 /// Allow time for a first dial and the reply, including over a relay.
@@ -117,7 +127,9 @@ pub enum Event<PI> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Timer<PI> {
     DoShuffle,
-    DoMaintenance,
+    /// The maintenance pass. Only the timer with the latest generation runs
+    /// it; an earlier one was superseded when the cadence changed.
+    DoMaintenance(u64),
     /// The timeout of the `Neighbor` to the peer with the given id.
     ///
     /// The id tells it from the timer of an earlier `Neighbor` to the same peer.
@@ -404,6 +416,11 @@ pub struct State<PI, RG = ThreadRng> {
     refused: HashSet<PI>,
     /// How many more requests a refill may send, see [`RefillLimit`].
     refill: RefillLimit,
+    /// Generation of the armed [`Timer::DoMaintenance`].
+    maintenance_generation: u64,
+    /// Whether the armed maintenance timer uses [`MAINTENANCE_INTERVAL`]
+    /// rather than [`STABLE_MAINTENANCE_INTERVAL`].
+    maintenance_short: bool,
 }
 
 impl<PI, RG> State<PI, RG>
@@ -434,6 +451,8 @@ where
             alive_disconnect_peers: Default::default(),
             refused: Default::default(),
             refill: RefillLimit::Automatic,
+            maintenance_generation: 0,
+            maintenance_short: false,
         }
     }
 
@@ -442,7 +461,11 @@ where
             InEvent::RecvMessage(from, message) => self.handle_message(from, message, io),
             InEvent::TimerExpired(timer) => match timer {
                 Timer::DoShuffle => self.handle_shuffle_timer(io),
-                Timer::DoMaintenance => self.handle_maintenance_timer(io),
+                Timer::DoMaintenance(generation) => {
+                    if generation == self.maintenance_generation {
+                        self.handle_maintenance_timer(io);
+                    }
+                }
                 Timer::PendingNeighborRequest(peer, id) => {
                     self.handle_pending_neighbor_timer(peer, id, io)
                 }
@@ -465,10 +488,10 @@ where
         if !self.timers_scheduled {
             self.timers_scheduled = true;
             self.schedule_shuffle(io);
-            io.push(OutEvent::ScheduleTimer(
-                MAINTENANCE_INTERVAL,
-                Timer::DoMaintenance,
-            ));
+            self.schedule_maintenance(io);
+        } else if !self.maintenance_short && self.wants_short_maintenance() {
+            // The node needs passes again while the slow backstop is armed.
+            self.schedule_maintenance(io);
         }
 
         #[cfg(test)]
@@ -945,9 +968,32 @@ where
                 self.refused.clear();
             }
         }
+        self.schedule_maintenance(io);
+    }
+
+    /// Returns whether maintenance passes must run at [`MAINTENANCE_INTERVAL`].
+    ///
+    /// That is when the active view is short, which includes having no peers,
+    /// as the refill and rejoin backoffs count such passes, and while a
+    /// recovery runs, as only a pass ends it.
+    fn wants_short_maintenance(&self) -> bool {
+        self.is_short() || self.refill == RefillLimit::Recovery
+    }
+
+    /// Arms the next maintenance pass, superseding any armed one: soon while
+    /// the node wants short passes, else at the long backstop, so a topic with
+    /// a healthy view rarely wakes.
+    fn schedule_maintenance(&mut self, io: &mut impl IO<PI>) {
+        self.maintenance_short = self.wants_short_maintenance();
+        self.maintenance_generation += 1;
+        let delay = if self.maintenance_short {
+            MAINTENANCE_INTERVAL
+        } else {
+            STABLE_MAINTENANCE_INTERVAL
+        };
         io.push(OutEvent::ScheduleTimer(
-            MAINTENANCE_INTERVAL,
-            Timer::DoMaintenance,
+            delay,
+            Timer::DoMaintenance(self.maintenance_generation),
         ));
     }
 
@@ -2067,10 +2113,16 @@ mod tests {
     fn rejoin_tries_a_recent_neighbor() {
         let mut state = new_state();
         state.active_view.insert(1);
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            &mut Io::new(),
+        );
         state.active_view.remove(&1);
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert_eq!(joined(io), vec![1]);
     }
 
@@ -2083,11 +2135,17 @@ mod tests {
             state.bootstrap_peers.push_back(1);
             state.active_view.insert(1);
             state.active_view.insert(2);
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                &mut Io::new(),
+            );
             state.active_view.remove(&1);
             state.active_view.remove(&2);
             let io = &mut Io::new();
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                io,
+            );
             assert_eq!(joined(io), vec![1, 2], "seed {seed}");
         }
     }
@@ -2110,7 +2168,10 @@ mod tests {
         assert_eq!(state.recent_neighbors, [1]);
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert_eq!(joined(io), vec![1]);
     }
 
@@ -2142,6 +2203,144 @@ mod tests {
         assert_eq!(Vec::from(state.recent_neighbors.clone()), expected);
     }
 
+    /// The maintenance delays `io` schedules.
+    fn maintenance_delays(io: &Io) -> Vec<Duration> {
+        io.iter()
+            .filter_map(|event| match event {
+                TopicOut::ScheduleTimer(delay, topic::Timer::Swarm(Timer::DoMaintenance(_))) => {
+                    Some(*delay)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A healthy active view waits for the long backstop between passes; once
+    /// it is short the short cadence resumes at once, and the superseded
+    /// timer does nothing when it fires.
+    #[test]
+    fn maintenance_backs_off_while_the_view_is_healthy() {
+        let mut state = new_state();
+        let neighbors = Config::default().active_view_capacity.div_ceil(2) as u32;
+        for peer in 1..=neighbors {
+            let accept = Message::Neighbor(Neighbor {
+                priority: Priority::High,
+                data: None,
+            });
+            state.handle(InEvent::RecvMessage(peer, accept), &mut Io::new());
+        }
+        assert!(!state.is_short());
+
+        // Maintenance ends a recovery; after that a healthy view backs off.
+        let io = &mut Io::new();
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
+        assert_eq!(maintenance_delays(io), vec![STABLE_MAINTENANCE_INTERVAL]);
+        let stale = state.maintenance_generation;
+
+        let io = &mut Io::new();
+        state.handle(InEvent::PeerDisconnected(1), io);
+        assert!(state.is_short());
+        assert_eq!(
+            maintenance_delays(io),
+            vec![MAINTENANCE_INTERVAL],
+            "a view that turns short re-arms the short cadence"
+        );
+
+        let io = &mut Io::new();
+        state.handle(InEvent::TimerExpired(Timer::DoMaintenance(stale)), io);
+        assert!(
+            maintenance_delays(io).is_empty(),
+            "the superseded timer neither runs a pass nor re-arms"
+        );
+
+        let io = &mut Io::new();
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
+        assert_eq!(maintenance_delays(io), vec![MAINTENANCE_INTERVAL]);
+    }
+
+    /// A recovery runs until a maintenance pass ends it, so the short cadence
+    /// is armed for it even if the view stays healthy.
+    #[test]
+    fn maintenance_runs_soon_to_end_a_recovery() {
+        let mut state = new_state();
+        for peer in 1..=Config::default().active_view_capacity as u32 {
+            let accept = Message::Neighbor(Neighbor {
+                priority: Priority::High,
+                data: None,
+            });
+            state.handle(InEvent::RecvMessage(peer, accept), &mut Io::new());
+        }
+        let io = &mut Io::new();
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
+        assert_eq!(maintenance_delays(io), vec![STABLE_MAINTENANCE_INTERVAL]);
+
+        // Losing one of a full view's peers leaves it healthy, but starts a
+        // recovery that asks the passive peer.
+        state.passive_view.insert(100);
+        let io = &mut Io::new();
+        state.handle(InEvent::PeerDisconnected(1), io);
+        assert!(!state.is_short());
+        assert_eq!(state.refill, RefillLimit::Recovery);
+        assert_eq!(maintenance_delays(io), vec![MAINTENANCE_INTERVAL]);
+
+        let io = &mut Io::new();
+        state.handle(
+            InEvent::RecvMessage(
+                100,
+                Message::Neighbor(Neighbor {
+                    priority: Priority::High,
+                    data: None,
+                }),
+            ),
+            io,
+        );
+        assert_eq!(state.refill, RefillLimit::Recovery);
+        let io = &mut Io::new();
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
+        assert_eq!(state.refill, RefillLimit::Automatic);
+        assert_eq!(maintenance_delays(io), vec![STABLE_MAINTENANCE_INTERVAL]);
+    }
+
+    /// The slow cadence never stretches the refill backoff: a node that is
+    /// short passes at the short interval from the first pass on, and the
+    /// backoff counts those passes.
+    #[test]
+    fn short_node_passes_at_the_short_interval() {
+        let mut state = new_state();
+        state.handle(InEvent::RequestJoin(1), &mut Io::new());
+        state.handle(
+            InEvent::RecvMessage(
+                1,
+                Message::Neighbor(Neighbor {
+                    priority: Priority::High,
+                    data: None,
+                }),
+            ),
+            &mut Io::new(),
+        );
+        assert!(state.is_short());
+        for _ in 0..30 {
+            let io = &mut Io::new();
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                io,
+            );
+            assert_eq!(maintenance_delays(io), vec![MAINTENANCE_INTERVAL]);
+        }
+    }
+
     /// A node that loses its last neighbor, with an empty passive view,
     /// rejoins through the peers the application joined.
     #[test]
@@ -2159,7 +2358,10 @@ mod tests {
         assert!(state.active_view.is_empty() && state.passive_view.is_empty());
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert_eq!(joined(io), vec![1], "no rejoin through the bootstrap peer");
     }
 
@@ -2171,10 +2373,13 @@ mod tests {
         let mut rejoins = Vec::new();
         for tick in 0..60 {
             let io = &mut Io::new();
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                io,
+            );
             assert!(io.iter().any(|event| matches!(
                 event,
-                TopicOut::ScheduleTimer(delay, topic::Timer::Swarm(Timer::DoMaintenance))
+                TopicOut::ScheduleTimer(delay, topic::Timer::Swarm(Timer::DoMaintenance(_)))
                     if *delay == MAINTENANCE_INTERVAL
             )));
             if !joined(io).is_empty() {
@@ -2190,7 +2395,10 @@ mod tests {
         let mut state = new_state();
         state.handle(InEvent::RequestJoin(1), &mut Io::new());
         for _ in 0..60 {
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                &mut Io::new(),
+            );
         }
         assert_eq!(state.passes_alone, 60);
         state.handle(
@@ -2203,11 +2411,17 @@ mod tests {
             ),
             &mut Io::new(),
         );
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            &mut Io::new(),
+        );
         assert_eq!(state.passes_alone, 0);
         state.handle(InEvent::PeerDisconnected(1), &mut Io::new());
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert_eq!(joined(io), vec![1]);
     }
 
@@ -2221,7 +2435,10 @@ mod tests {
         }
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         let requested: Vec<u32> = (10..20).filter(|peer| sent_neighbor(io, *peer)).collect();
         assert_eq!(requested.len(), 1, "expected one neighbor request: {io:?}");
     }
@@ -2240,7 +2457,10 @@ mod tests {
         }
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert!(
             !io.iter()
                 .any(|event| matches!(event, TopicOut::SendMessage(..))),
@@ -2279,7 +2499,10 @@ mod tests {
 
         // An isolated node rejoins through every remembered contact.
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         let mut rejoined = joined(io);
         rejoined.sort();
         let mut expected: Vec<u32> = state.bootstrap_peers.iter().copied().collect();
@@ -2358,14 +2581,20 @@ mod tests {
     fn refused_peers_are_asked_again_only_after_maintenance() {
         let mut state = short_state(10..12);
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         let mut asked = neighbors_sent(io);
         asked.extend(refuse_pending(&mut state));
         asked.sort();
         assert_eq!(asked, vec![10, 11], "each passive peer once");
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert_eq!(neighbors_sent(io).len(), 1, "the next pass asks again");
     }
 
@@ -2374,7 +2603,10 @@ mod tests {
     fn maintenance_refill_sends_a_few_requests() {
         let mut state = short_state(10..20);
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         let mut asked = neighbors_sent(io);
         // The first request fails with its dial.
         let io = &mut Io::new();
@@ -2449,7 +2681,10 @@ mod tests {
                 state.active_view.insert(2);
                 state.handle(InEvent::PeerDisconnected(2), io);
             } else {
-                state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+                state.handle(
+                    InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                    io,
+                );
             }
             assert_eq!(neighbors_sent(io), vec![10]);
             let mut asked = neighbors_sent(io);
@@ -2483,7 +2718,10 @@ mod tests {
             );
             state.handle(InEvent::PeerDisconnected(11), io);
             if recovery {
-                state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+                state.handle(
+                    InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                    io,
+                );
                 assert!(
                     neighbors_sent(io).is_empty(),
                     "maintenance interrupted recovery"
@@ -2522,7 +2760,10 @@ mod tests {
             assert!(state.pending_neighbor_requests.is_empty());
             // Once all Disconnects arrived, maintenance may start a new refill.
             io.clear();
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                io,
+            );
             assert_eq!(neighbors_sent(io).len(), 1);
         }
     }
@@ -2532,7 +2773,10 @@ mod tests {
     fn new_shuffle_contacts_restart_an_exhausted_refill() {
         let mut state = short_state(10..20);
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         let mut asked = neighbors_sent(io);
         for request in 0..MAX_REQUESTS_PER_REFILL {
             let peer = *state.pending_neighbor_requests.keys().next().unwrap();
@@ -2585,14 +2829,20 @@ mod tests {
     fn refill_after_a_neighbor_left_has_no_limit() {
         let mut state = short_state(10..20);
         state.active_view.insert(2);
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            &mut Io::new(),
+        );
         refuse_pending(&mut state);
 
         let io = &mut Io::new();
         state.handle(InEvent::PeerDisconnected(2), io);
         let mut asked = neighbors_sent(io);
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         asked.extend(neighbors_sent(io));
         asked.extend(refuse_pending(&mut state));
         asked.sort();
@@ -2606,7 +2856,10 @@ mod tests {
         let mut refills = Vec::new();
         for tick in 0..60 {
             let io = &mut Io::new();
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                io,
+            );
             refuse_pending(&mut state);
             if !neighbors_sent(io).is_empty() {
                 refills.push(tick);
@@ -2617,7 +2870,10 @@ mod tests {
         let join = Message::Join(None);
         state.handle(InEvent::RecvMessage(2, join), &mut Io::new());
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert!(!neighbors_sent(io).is_empty(), "the backoff went on");
     }
 
@@ -2627,16 +2883,25 @@ mod tests {
         let mut state = short_state(10..40);
         state.active_view.insert(2);
         for _ in 0..3 {
-            state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+            state.handle(
+                InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+                &mut Io::new(),
+            );
             refuse_pending(&mut state);
         }
         // The recovery still waits for a reply in the 4th pass, which is due.
         state.handle(InEvent::PeerDisconnected(2), &mut Io::new());
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            &mut Io::new(),
+        );
         refuse_pending(&mut state);
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert!(!neighbors_sent(io).is_empty(), "the due pass got lost");
     }
 
@@ -2647,13 +2912,19 @@ mod tests {
     #[test]
     fn node_without_neighbors_asks_a_peer_that_refused() {
         let mut state = short_state(10..11);
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), &mut Io::new());
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            &mut Io::new(),
+        );
         state.handle(InEvent::PeerDisconnected(1), &mut Io::new());
         refuse_pending(&mut state);
         assert!(state.active_view.is_empty() && state.refused.contains(&10));
 
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         assert_eq!(neighbors_sent(io), vec![10]);
     }
 
@@ -2685,7 +2956,10 @@ mod tests {
             state.passive_view.insert(peer);
         }
         let io = &mut Io::new();
-        state.handle(InEvent::TimerExpired(Timer::DoMaintenance), io);
+        state.handle(
+            InEvent::TimerExpired(Timer::DoMaintenance(state.maintenance_generation)),
+            io,
+        );
         let mut asked = neighbors_sent(io);
         while let Some((peer, id)) = state
             .pending_neighbor_requests
