@@ -23,17 +23,17 @@ Historical and current tag schemes in this repository:
 |---|---|
 | Upstream base | `v0.102.0` (`a16f016c`) |
 | Integration branch | `upgrade/iroh-gossip-v0.102.0` |
-| Tag | `aster-iroh-gossip-v0.102.1001` |
-| Pinned commit | `39a2ed2c8b5e99d2fb49f887e9589804cd441c82` |
+| Tag | `aster-iroh-gossip-v0.102.1001-p1` (`aster-iroh-gossip-v0.102.1001` is the previous pin) |
+| Pinned commit | `6d13a6527da5d7923e5e0f117b2140e0cebc2b7f` |
 | Crate version | 0.102.1001 (workspace spec `iroh-gossip = "0.102.1001"`) |
 | Source repository | `https://forge.emrul.dev/Aster/iroh-gossip.git` |
 
-The fork's own `[patch.crates-io]` (row 17) pins iroh `9ba1447d` (1.4.2002) and noq `379f73677c` (1.4.1001), the stack Aster links it against, unchanged from 0.101.1003. Upstream v0.102.0 contains every upstream fix rows 29 and 58 backported and the fixes rows 55 and 56 made locally, so the stack is now row 17, row 83 (re-cut), rows 84 and 85 (new) and the `.gitignore` line; see the 2026-11-09 History entry.
+The fork's own `[patch.crates-io]` (row 17) pins iroh `370b54434` (1.4.2003) and noq `4e193fb2d` (1.4.1002), the stack Aster links it against (`6d13a652`, the `-p1` re-pin; `39a2ed2c` held iroh 1.4.2002 and noq 1.4.1001). Upstream v0.102.0 contains every upstream fix rows 29 and 58 backported and the fixes rows 55 and 56 made locally, so the stack is now row 17, row 83 (re-cut), rows 84 and 85 (new) and the `.gitignore` line; see the 2026-11-09 History entry.
 
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "39a2ed2c8b5e99d2fb49f887e9589804cd441c82" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "6d13a6527da5d7923e5e0f117b2140e0cebc2b7f" }
 ```
 
 ## Patches
@@ -141,7 +141,15 @@ Before the current branch model, fork `main` mirrored upstream `main` and was re
 
 ## History
 
-### iroh-family upstream wave (2026-11-09), current
+### iroh 1.4.2003 and noq 1.4.1002 re-pin (2026-11-10), current
+
+| Upstream base | Tag | Pinned commit | Branch |
+|---|---|---|---|
+| `v0.102.0` | `aster-iroh-gossip-v0.102.1001-p1` | `6d13a6527da5d7923e5e0f117b2140e0cebc2b7f` | `upgrade/iroh-gossip-v0.102.0` |
+
+- **`aster-iroh-gossip-v0.102.1001-p1`** (`6d13a652`): re-pin only (row 17; "build: re-pin noq 1.4.1002 and iroh 1.4.2003"), to iroh `370b54434` (Aster iroh 1.4.2003) and noq `4e193fb2d` (Aster noq 1.4.1002), the "vpn-paths" wave. No code or version change; the crate stays 0.102.1001. Validation: `cargo test` main suite 208 passed (3 ignored), 0 failed.
+
+### iroh-family upstream wave (2026-11-09)
 
 | Upstream base | Tag | Pinned commit | Branch |
 |---|---|---|---|
