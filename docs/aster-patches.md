@@ -30,6 +30,8 @@ Historical and current tag schemes in this repository:
 
 The fork's own `[patch.crates-io]` (row 17) pins iroh `b010df8a65` (1.5.1001) and noq `819373faf` (1.5.1001), the stack Aster links it against (`a7a8c52b`; the `-p1` re-pin `6d13a652` held iroh 1.4.2003 and noq 1.4.1002). Upstream v0.102.0 contains every upstream fix rows 29 and 58 backported and the fixes rows 55 and 56 made locally; upstream v0.103.0 removed the function row 85 patched. The stack is now row 17, row 83 (hand re-ported onto the `IO` trait, with the G3 fix), row 84 and the `.gitignore` line; see the 2026-11-24 History entry. **Row 83's G3 defect (an earlier cache expiry did not supersede the armed Plumtree eviction timer) is present in the shipped 0.102.1001 line and fixed only from 0.103.1001.**
 
+**Re-pin 2026-11-24 (`aster-iroh-gossip-v0.103.1001-p1`, `c94c9f07`), supersedes the iroh pin above:** the fork's `[patch.crates-io]` and lock name iroh `b0fac795ec` (Aster iroh 1.5.1002, tag `aster-iroh-v1.5.1002`). iroh 1.5.1002 differs from 1.5.1001 only in manifests: iroh now requires the iroh-relay it ships (iroh ledger row `relay-requirement`). No version change; noq unchanged. Aster's `fork_compat` ran the suite on it: 0 failed.
+
 Bootstrap pin line for source-tree builds (consumers install a versioned Aster SDK release instead and must not copy this):
 
 ```toml
