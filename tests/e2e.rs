@@ -22,9 +22,7 @@ use iroh::{
     Endpoint, EndpointId, RelayMode, SecretKey,
 };
 use iroh_gossip::{
-    api::{Event, GossipReceiver, GossipSender},
-    net::{Builder, Gossip, GOSSIP_ALPN},
-    proto::TopicId,
+    Builder, Event, Gossip, GossipReceiver, GossipSender, JoinOptions, TopicId, ALPN,
 };
 use n0_error::{bail_any, Result, StdResultExt};
 use n0_future::{task::AbortOnDropHandle, StreamExt};
@@ -89,7 +87,7 @@ impl Node {
         let endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Disabled)
             .secret_key(secret.clone())
-            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec()])
             .transport_config(transport)
             .bind()
             .await
@@ -1107,7 +1105,7 @@ async fn slow_peer_does_not_block_shutdown() -> Result {
     let mut sa = Sub::new(&a, t, vec![]).await?;
     let conn = b
         .endpoint
-        .connect(a.endpoint.addr(), GOSSIP_ALPN)
+        .connect(a.endpoint.addr(), ALPN)
         .await
         .std_context("connect")?;
     let mut stream = conn.open_uni().await.std_context("open raw stream")?;
@@ -1123,7 +1121,7 @@ async fn slow_peer_does_not_block_shutdown() -> Result {
         for _ in 0..10000 {
             sa.tx.broadcast_neighbors(bytes.clone()).await?;
         }
-        Ok::<_, iroh_gossip::api::ApiError>(())
+        Ok::<_, iroh_gossip::Error>(())
     });
     sleep(Duration::from_secs(2)).await;
     let result = timeout(Duration::from_secs(2), a.gossip.shutdown()).await;
@@ -1131,4 +1129,62 @@ async fn slow_peer_does_not_block_shutdown() -> Result {
     sender.abort();
     result.std_context("a flow-controlled peer blocked gossip shutdown")??;
     Ok(())
+}
+
+/// A new subscriber gets every current neighbor, even with a capacity of 1.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn new_subscriber_gets_all_neighbors() -> Result {
+    let lookup = MemoryLookup::new();
+    let a = Node::spawn(&lookup).await?;
+    let t = topic("all_neighbors");
+    let mut sa = Sub::new(&a, t, vec![]).await?;
+    let mut others = Vec::new();
+    for _ in 0..3 {
+        let node = Node::spawn(&lookup).await?;
+        let sub = Sub::new(&node, t, vec![a.id()]).await?;
+        sa.neighbor_up(node.id()).await?;
+        others.push((node, sub));
+    }
+
+    let opts = JoinOptions::with_bootstrap([]).with_subscription_capacity(1);
+    let (tx, rx) = a.gossip.subscribe_with_opts(t, opts).await?.split();
+    let mut late = Sub { tx, rx };
+    for (node, _) in &others {
+        late.neighbor_up(node.id()).await?;
+    }
+    assert_eq!(late.rx.neighbors().count(), 3);
+
+    let (gone, _gone_sub) = others.remove(0);
+    gone.gossip.shutdown().await.std_context("shutdown")?;
+    late.neighbor_down(gone.id()).await?;
+    assert!(late.rx.is_joined());
+    assert_eq!(late.rx.neighbors().count(), 2);
+    Ok(())
+}
+
+/// A broadcast of the largest content that the sender takes reaches the peer.
+///
+/// The send queue once sized a message with its topic, 32 bytes more than the frame.
+/// A broadcast near the limit then went out as too large, and reached no peer.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn broadcast_of_the_content_limit_arrives() -> Result {
+    let lookup = MemoryLookup::new();
+    let (a, b) = (Node::spawn(&lookup).await?, Node::spawn(&lookup).await?);
+    let t = topic("content_limit");
+    let mut sa = Sub::new(&a, t, vec![]).await?;
+    let sb = Sub::join(&b, t, vec![a.id()]).await?;
+    sa.neighbor_up(b.id()).await?;
+    let max = sb.tx.max_content_size();
+    let content = Bytes::from(vec![7u8; max]);
+    sb.tx
+        .broadcast(content.clone())
+        .await
+        .std_context("broadcast")?;
+    sa.wait(
+        PROMPT,
+        |e| matches!(e, Event::Received(m) if m.content == content),
+    )
+    .await
 }

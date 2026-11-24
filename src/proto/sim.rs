@@ -13,8 +13,11 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, debug_span, info, info_span, trace, warn};
 
-use super::{Command, Config, Event, InEvent, OutEvent, PeerIdentity, State, TopicId};
-use crate::proto::{PeerData, Scope};
+use super::{Command, Config, Event, InEvent, PeerIdentity, State, TopicId, IO};
+use crate::proto::{
+    state::{Message, Timer},
+    PeerData, Scope,
+};
 
 const DEFAULT_LATENCY_STATIC: Duration = Duration::from_millis(50);
 const DEFAULT_LATENCY_MIN: Duration = Duration::from_millis(10);
@@ -45,16 +48,26 @@ impl From<Config> for NetworkConfig {
 #[serde(rename_all = "lowercase")]
 pub enum LatencyConfig {
     /// Use the same latency, always.
-    Static(#[serde(with = "humantime_serde")] Duration),
-    /// Chose a random latency for each connection within the specified bounds.
+    Static(#[serde(with = "duration_str")] Duration),
+    /// Chooses a random latency for each connection within the specified bounds.
     Dynamic {
         /// The lower bound for the latency between two peers.
-        #[serde(with = "humantime_serde")]
+        #[serde(with = "duration_str")]
         min: Duration,
         /// The upper bound for the latency between two peers.
-        #[serde(with = "humantime_serde")]
+        #[serde(with = "duration_str")]
         max: Duration,
     },
+}
+
+/// Reads and writes a [`Duration`] in the friendly format of jiff, such as `"50ms"` or `"1s 500ms"`.
+///
+/// It reads fractions such as `"1.5s"` and the units from `ns` to `h`, and writes nanoseconds
+/// exactly.
+mod duration_str {
+    pub(super) use jiff::fmt::serde::unsigned_duration::friendly::compact::required::{
+        deserialize, serialize,
+    };
 }
 
 impl LatencyConfig {
@@ -113,9 +126,12 @@ pub struct Network<PI, R> {
     tick: usize,
     peers: BTreeMap<PI, State<PI, R>>,
     conns: BTreeSet<ConnId<PI>>,
-    /// When each closed connection was closed, to tell messages sent over it
-    /// apart from messages that open a new one.
-    closed_at: FxHashMap<ConnId<PI>, Instant>,
+    /// When each closed connection closed, in the order of the sends.
+    ///
+    /// It tells messages sent over a closed connection apart from messages that open a new one.
+    /// The value is the sequence number that the event queue gives its next event. A message
+    /// with a lower one was sent before the close.
+    closed_at: FxHashMap<ConnId<PI>, i32>,
     events: VecDeque<(PI, TopicId, Event<PI>)>,
     latencies: FxHashMap<ConnId<PI>, Duration>,
     rng: R,
@@ -363,7 +379,7 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
 
     fn tick(&mut self) {
         self.tick += 1;
-        let Some((time, peer, event)) = self.queue.pop() else {
+        let Some((time, seq, peer, event)) = self.queue.pop() else {
             warn!("tick on empty queue");
             return;
         };
@@ -405,21 +421,15 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
                 // A message sent before its connection closed arrives over that
                 // connection. One sent afterwards opens a new connection.
                 let conn: ConnId<PI> = (*from, peer).into();
-                let latency = latency_between(
-                    &self.config.latency,
-                    &mut self.latencies,
-                    from,
-                    &peer,
-                    &mut self.rng,
-                );
-                let sent_at = self.time - latency;
                 // A sender that is gone sent this before it went, so it cannot
-                // open anything.
+                // open anything. The queue numbers its events in the order of the
+                // sends, so a message sent in the event that closed the connection
+                // went out before the close, as in the runtime.
                 let over_closed = !self.peers.contains_key(from)
                     || self
                         .closed_at
                         .get(&conn)
-                        .is_some_and(|closed_at| sent_at < *closed_at);
+                        .is_some_and(|closed_at| seq < *closed_at);
                 if !over_closed {
                     self.closed_at.remove(&conn);
                     self.conns.insert(conn);
@@ -435,50 +445,66 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
             _ => {}
         }
         let state = self.peers.get_mut(&peer).expect("checked above");
-        let out = state.handle(event, self.time, None);
-        let mut kill = vec![];
-        for event in out {
-            match event {
-                OutEvent::SendMessage(to, message) => {
-                    let latency = latency_between(
-                        &self.config.latency,
-                        &mut self.latencies,
-                        &peer,
-                        &to,
-                        &mut self.rng,
-                    );
-                    self.queue
-                        .insert(self.time + latency, to, InEvent::RecvMessage(peer, message));
-                }
-                OutEvent::ScheduleTimer(time, timer) => {
-                    if !(self.cycles_stopped && timer.is_membership_cycle()) {
-                        self.queue
-                            .insert(self.time + time, peer, InEvent::TimerExpired(timer));
-                    }
-                }
-                OutEvent::DisconnectPeer(to) => {
-                    debug!(peer = ?peer, other = ?to, "disconnect");
-                    kill.push((peer, to));
-                }
-                OutEvent::EmitEvent(topic, event) => {
-                    debug!(peer = ?peer, "emit {event:?}");
-                    self.events.push_back((peer, topic, event));
-                }
-                OutEvent::PeerData(_peer, _data) => {}
+        let mut io = SimIO {
+            peer,
+            time: self.time,
+            cycles_stopped: self.cycles_stopped,
+            latency: &self.config.latency,
+            latencies: &mut self.latencies,
+            rng: &mut self.rng,
+            queue: &mut self.queue,
+            events: &mut self.events,
+            sent: Vec::new(),
+        };
+        // Peers that the event can make unwanted: the ones wanted before it, the one
+        // it came from, and the ones it sent to. A connection that only a message
+        // opened, such as a Plumtree straggler, does not show that the peer is
+        // wanted. The runtime closes its queue.
+        let may_affect_membership = event.may_affect_membership();
+        let mut touched: Vec<PI> = Vec::new();
+        if may_affect_membership {
+            touched.extend(
+                (self.conns.iter())
+                    .filter_map(|conn| conn.other(peer))
+                    .filter(|other| state.wants_connection(other)),
+            );
+            if let InEvent::RecvMessage(from, _) | InEvent::PeerDisconnected(from) = &event {
+                touched.push(*from);
             }
         }
-        for (from, to) in kill {
-            self.kill_connection(from, to);
+        state.handle(event, self.time, &mut io);
+        // Close the connections to peers that no topic wants.
+        let unwanted: Vec<_> = if may_affect_membership {
+            touched.extend(io.sent);
+            (self.conns.iter())
+                .filter_map(|conn| conn.other(peer))
+                .filter(|other| touched.contains(other) && !state.wants_connection(other))
+                .collect()
+        } else {
+            // A send reopens the queue to a peer, as the runtime does. A reply to a peer
+            // that no topic wants, such as a Plumtree reply, must not keep its
+            // connection open.
+            let mut sent = io.sent;
+            sent.sort();
+            sent.dedup();
+            sent.into_iter()
+                .filter(|other| {
+                    self.conns.contains(&(peer, *other).into()) && !state.wants_connection(other)
+                })
+                .collect()
+        };
+        for other in unwanted {
+            self.kill_connection(peer, other);
         }
     }
 
     /// Breaks the connection between two peers.
     ///
-    /// The `to` peer will received a [`InEvent::PeerDisconnected`] after a latency interval.
+    /// The `to` peer receives an [`InEvent::PeerDisconnected`] after a latency interval.
     fn kill_connection(&mut self, from: PI, to: PI) {
         let conn = ConnId::from((from, to));
         if self.conns.remove(&conn) {
-            self.closed_at.insert(conn, self.time);
+            self.closed_at.insert(conn, self.queue.seq);
             // We add the event a microsecond after the regular latency between the two peers,
             // so that any messages queued from the current time arrive before the disconnected event.
             let latency = latency_between(
@@ -499,7 +525,7 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
     /// - that all active view members (neighbors) have X listed as a neighbor as well
     /// - that all eager peers have X listed as eager as well
     ///
-    /// Returns `true` if this is holds, otherwise returns `false`.
+    /// Returns `true` if this holds, otherwise returns `false`.
     ///
     /// Logs, at debug level, the cases where the above doesn't hold.
     pub fn check_synchronicity(&self) -> bool {
@@ -618,6 +644,44 @@ impl<PI: PeerIdentity + fmt::Display, R: Rng + SeedableRng> Network<PI, R> {
     }
 }
 
+/// The IO of one peer in the simulation: it queues what the peer does.
+struct SimIO<'a, PI, R> {
+    peer: PI,
+    time: Instant,
+    cycles_stopped: bool,
+    latency: &'a LatencyConfig,
+    latencies: &'a mut FxHashMap<ConnId<PI>, Duration>,
+    rng: &'a mut R,
+    queue: &'a mut TimedEventQueue<PI>,
+    events: &'a mut VecDeque<(PI, TopicId, Event<PI>)>,
+    /// The peers that the peer sent to.
+    sent: Vec<PI>,
+}
+
+impl<PI: PeerIdentity + Ord, R: Rng> IO<PI> for SimIO<'_, PI, R> {
+    fn send(&mut self, to: PI, message: Message<PI>) -> Option<Message<PI>> {
+        let latency = latency_between(self.latency, self.latencies, &self.peer, &to, self.rng);
+        let event = InEvent::RecvMessage(self.peer, message);
+        self.sent.push(to);
+        self.queue.insert(self.time + latency, to, event);
+        None
+    }
+
+    fn emit(&mut self, topic: TopicId, event: Event<PI>) {
+        debug!(peer = ?self.peer, "emit {event:?}");
+        self.events.push_back((self.peer, topic, event));
+    }
+
+    fn schedule(&mut self, delay: Duration, timer: Timer<PI>) {
+        if !(self.cycles_stopped && timer.is_membership_cycle()) {
+            let event = InEvent::TimerExpired(timer);
+            self.queue.insert(self.time + delay, self.peer, event);
+        }
+    }
+
+    fn peer_data(&mut self, _peer: PI, _data: PeerData) {}
+}
+
 fn latency_between<PI: PeerIdentity + Ord + PartialOrd, R: Rng>(
     latency_config: &LatencyConfig,
     latencies: &mut FxHashMap<ConnId<PI>, Duration>,
@@ -659,10 +723,11 @@ impl<PI> TimedEventQueue<PI> {
         ))
     }
 
-    fn pop(&mut self) -> Option<(Instant, PI, InEvent<PI>)> {
+    /// Returns the next event, with its sequence number in the order of the inserts.
+    fn pop(&mut self) -> Option<(Instant, i32, PI, InEvent<PI>)> {
         self.events
             .pop()
-            .map(|(e, _)| (e.time, e.event.0, e.event.1))
+            .map(|(e, neg_seq)| (e.time, -neg_seq, e.event.0, e.event.1))
     }
 
     fn peek_next(&self) -> Option<Instant> {
@@ -734,8 +799,7 @@ pub enum BootstrapMode {
     /// those, see [`Simulator::bootstrap_sequential`].
     #[default]
     Single,
-    /// First `count` bootstrap peers are created and join each other,
-    /// then the remaining peers join the swarm by joining one of these first `count` peers.
+    /// `count` bootstrap peers join each other, then the other peers join through one of them.
     Set {
         /// Number of bootstrap peers to join first
         count: u64,
@@ -778,8 +842,9 @@ pub struct RoundStats {
     /// Payloads per recipient, minus 1, as in Plumtree 2.3. A round with no
     /// recipient has 0.
     pub rmr: f32,
-    /// The last delivery hop in this round: the most hops a payload took to a
-    /// recipient, counting the first link.
+    /// The last delivery hop in this round: the most hops a payload took to a recipient.
+    ///
+    /// The count includes the first link.
     pub ldh: f32,
     /// The number of undelivered messages in this round.
     pub missed: f32,
@@ -921,7 +986,7 @@ pub struct RoundStatsAvg {
 pub struct RoundStatsAvgDiff {
     /// The difference, as factors, in the minimums.
     pub min: RoundStatsDiff,
-    /// The difference, as factors, in the maximumx.
+    /// The difference, as factors, in the maximums.
     pub max: RoundStatsDiff,
     /// The difference, as factors, in the mean values.
     pub mean: RoundStatsDiff,
@@ -1062,7 +1127,7 @@ impl Simulator {
         }
     }
 
-    /// Creates a new random number generator, derived from the simuator's RNG.
+    /// Creates a new random number generator, derived from the simulator's RNG.
     pub fn rng(&mut self) -> ChaCha12Rng {
         ChaCha12Rng::from_rng(&mut self.network.rng)
     }
@@ -1443,5 +1508,80 @@ mod round_stats_tests {
         assert_eq!(combined.mean.rmr, 3.);
         assert_eq!(combined.mean.duration, Duration::from_millis(3000));
         assert_eq!(combined.len, 4);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// Latency durations read the formats of the simulator configs, and write so that they read back.
+    #[test]
+    fn latency_durations_read_and_write() {
+        use jiff::fmt::friendly::{Designator, SpanPrinter};
+        use serde::de::value::{Error, StrDeserializer};
+        let parse = |text: &str| duration_str::deserialize(StrDeserializer::<Error>::new(text));
+        let cases = [
+            ("10ms", Duration::from_millis(10)),
+            ("1.5s", Duration::from_millis(1500)),
+            ("1s 500ms", Duration::from_millis(1500)),
+            ("500ns", Duration::from_nanos(500)),
+            ("250us", Duration::from_micros(250)),
+            ("1m", Duration::from_secs(60)),
+        ];
+        for (text, duration) in cases {
+            assert_eq!(parse(text).ok(), Some(duration), "{text:?}");
+        }
+        for invalid in ["", "ms", "10 parsecs", "-1ms"] {
+            assert!(parse(invalid).is_err(), "{invalid:?}");
+        }
+        // The same printer as the serializer, so a written duration reads back exactly.
+        let printer = SpanPrinter::new().designator(Designator::Compact);
+        for duration in [
+            Duration::from_nanos(500),
+            Duration::from_nanos(1500),
+            Duration::from_micros(1500),
+            Duration::from_millis(50),
+        ] {
+            let text = printer.unsigned_duration_to_string(&duration);
+            assert_eq!(parse(&text).ok(), Some(duration), "{text:?}");
+        }
+    }
+
+    /// A Plumtree reply to a peer that no topic wants closes the connection after it.
+    ///
+    /// Peer 3 is on the topic, but no neighbor of 2. It pushes a message to 2 that 2 has
+    /// already. 2 answers with a `Prune`, which reopens its queue to 3. The connection
+    /// then closes again, as in the runtime.
+    #[test]
+    fn reply_to_an_unwanted_peer_closes_the_connection() {
+        use crate::proto::{plumtree, topic};
+        let topic = TopicId::from_bytes([0; 32]);
+        let mut network: Network<PeerId, rand::rngs::ChaCha12Rng> = Network::new(
+            NetworkConfig::default(),
+            rand::SeedableRng::seed_from_u64(1),
+        );
+        network.insert_and_join(1, topic, vec![]);
+        network.insert_and_join(2, topic, vec![1]);
+        network.insert_and_join(3, topic, vec![]);
+        network.run_trips(4);
+        let content = Bytes::from_static(b"hello");
+        network.command(1, topic, Command::Broadcast(content.clone(), Scope::Swarm));
+        network.run_trips(4);
+        assert!(network.conns().contains(&(1, 2)));
+        assert!(!network.conns().contains(&(2, 3)));
+
+        let push = Message {
+            topic,
+            message: topic::Message::Gossip(plumtree::Message::test_payload(content)),
+        };
+        let at = network.time;
+        network.queue.insert(at, 2, InEvent::RecvMessage(3, push));
+        network.run_trips(4);
+        assert!(
+            !network.conns().contains(&(2, 3)),
+            "the connection stayed open"
+        );
+        assert!(network.conns().contains(&(1, 2)));
     }
 }

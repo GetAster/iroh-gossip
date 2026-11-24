@@ -1,6 +1,6 @@
 //! Implementation of the HyParView membership protocol
 //!
-//! The implementation is based on [this paper][paper] by Joao Leitao, Jose Pereira, Luıs Rodrigues
+//! The implementation is based on [this paper][paper] by Joao Leitao, Jose Pereira, Luís Rodrigues
 //! and the [example implementation][impl] by Bartosz Sypytkowski
 //!
 //! [paper]: https://asc.di.fct.unl.pt/~jleitao/pdf/dsn07-leitao.pdf
@@ -14,13 +14,17 @@ use rand::{rngs::ThreadRng, seq::IteratorRandom, Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::{util::IndexSet, PeerData, PeerIdentity, PeerInfo, IO};
+use super::{
+    topic::{Event, IO},
+    util::IndexSet,
+    PeerData, PeerIdentity, PeerInfo,
+};
 
 /// Delay before the first shuffle.
 ///
 /// The interval doubles after each shuffle up to [`Config::shuffle_interval`].
 /// A join leaves the passive view small and lopsided: it holds only the peers
-/// that `ForwardJoin` walks passed by. The first shuffles fill it. The HyParView
+/// that `ForwardJoin` walks passed through. The first shuffles fill it. The HyParView
 /// paper shuffles at a fixed period, without jitter.
 const INITIAL_SHUFFLE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -89,30 +93,6 @@ pub enum InEvent<PI> {
     Quit,
 }
 
-/// Output event for HyParView
-#[derive(Debug)]
-pub enum OutEvent<PI> {
-    /// Ask the IO layer to send a [`Message`] to peer `PI`.
-    SendMessage(PI, Message<PI>),
-    /// Schedule a [`Timer`].
-    ScheduleTimer(Duration, Timer<PI>),
-    /// Ask the IO layer to close the connection to peer `PI`.
-    DisconnectPeer(PI),
-    /// Emit an [`Event`] to the application.
-    EmitEvent(Event<PI>),
-    /// New [`PeerData`] was received for peer `PI`.
-    PeerData(PI, PeerData),
-}
-
-/// Event emitted by the [`State`] to the application.
-#[derive(Clone, Debug)]
-pub enum Event<PI> {
-    /// A peer was added to our set of active connections.
-    NeighborUp(PI),
-    /// A peer was removed from our set of active connections.
-    NeighborDown(PI),
-}
-
 /// Kinds of timers HyParView needs to schedule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Timer<PI> {
@@ -131,21 +111,24 @@ pub enum Timer<PI> {
 pub enum Message<PI> {
     /// Sent to a peer if you want to join the swarm
     Join(Option<PeerData>),
-    /// When receiving Join, ForwardJoin is forwarded to the peer's ActiveView to introduce the
-    /// new member.
+    /// Introduces a new member to the receiver.
+    ///
+    /// A node that receives a `Join` sends a `ForwardJoin` to the peers of its active view.
     ForwardJoin(ForwardJoin<PI>),
-    /// A shuffle request is sent occasionally to re-shuffle the PassiveView with contacts from
-    /// other peers.
+    /// Asks a peer to exchange contacts, to refresh the passive views.
+    ///
+    /// A node sends it from time to time.
     Shuffle(Shuffle<PI>),
-    /// Peers reply to [`Message::Shuffle`] requests with a random peers from their active and
-    /// passive views.
+    /// Answers a [`Message::Shuffle`] with random peers from the active and passive views.
     ShuffleReply(ShuffleReply<PI>),
-    /// Request to add sender to an active view of recipient. If [`Neighbor::priority`] is
-    /// [`Priority::High`], the request cannot be denied.
+    /// Asks the receiver to add the sender to its active view.
+    ///
+    /// If [`Neighbor::priority`] is [`Priority::High`], the receiver cannot deny the request.
     Neighbor(Neighbor),
-    /// Request to disconnect from a peer.
-    /// If [`Disconnect::alive`] is true, the other peer is not shutting down, so it should be
-    /// added to the passive set.
+    /// Asks the receiver to drop the sender from its active view.
+    ///
+    /// If [`Disconnect::alive`] is true, the sender does not shut down, so the receiver adds it to
+    /// its passive view.
     Disconnect(Disconnect),
 }
 
@@ -154,7 +137,7 @@ pub enum Message<PI> {
 /// Each time a message is forwarded, the `Ttl` is decreased by 1. If the `Ttl` reaches 0, it
 /// should not be forwarded further.
 #[derive(From, Sub, Eq, PartialEq, Clone, Debug, Copy, Serialize, Deserialize)]
-pub struct Ttl(pub u16);
+pub struct Ttl(pub(crate) u16);
 impl Ttl {
     /// Returns `true` once the message may not be forwarded any further.
     pub fn expired(&self) -> bool {
@@ -224,8 +207,9 @@ pub struct ForwardJoin<PI> {
     ttl: Ttl,
 }
 
-/// Shuffle messages are sent occasionally to shuffle our passive view with peers from other peer's
-/// active and passive views.
+/// Exchanges contacts between the passive views of two peers.
+///
+/// A node sends it from time to time, with peers from its active and passive views.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Shuffle<PI> {
     /// The peer that initiated the shuffle request.
@@ -236,7 +220,7 @@ pub struct Shuffle<PI> {
     ttl: Ttl,
 }
 
-/// Once a shuffle messages reaches a [`Ttl`] of 0, a peer replies with a `ShuffleReply`.
+/// Once a shuffle message reaches a [`Ttl`] of 0, a peer replies with a `ShuffleReply`.
 ///
 /// The reply is sent to the peer that initiated the shuffle and contains a subset of the active
 /// and passive views of the peer at the end of the random walk.
@@ -246,7 +230,7 @@ pub struct ShuffleReply<PI> {
     nodes: Vec<PeerInfo<PI>>,
 }
 
-/// The priority of a `Join` message
+/// The priority of a `Neighbor` request.
 ///
 /// This is `High` if the sender does not have any active peers, and `Low` otherwise.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -259,8 +243,9 @@ pub enum Priority {
     Low,
 }
 
-/// A neighbor message is sent after adding a peer to our active view to inform them that we are
-/// now neighbors.
+/// Tells a peer that we added it to our active view.
+///
+/// From then on, the two peers are neighbors.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Neighbor {
     /// The priority of the `Join` or `ForwardJoin` message that triggered this neighbor request.
@@ -283,20 +268,18 @@ pub struct Disconnect {
 /// Configuration for the swarm membership layer
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct Config {
     /// Number of peers to which active connections are maintained
     pub active_view_capacity: usize,
-    /// Number of peers for which contact information is remembered,
-    /// but to which we are not actively connected to.
+    /// Number of peers whose contact information we keep, without a connection to them.
     pub passive_view_capacity: usize,
-    /// Number of hops a `ForwardJoin` message is propagated until the new peer's info
-    /// is added to a peer's active view.
-    pub active_random_walk_length: Ttl,
-    /// Number of hops a `ForwardJoin` message is propagated until the new peer's info
-    /// is added to a peer's passive view.
-    pub passive_random_walk_length: Ttl,
+    /// Number of hops a `ForwardJoin` travels before a peer adds the new peer to its active view.
+    pub active_random_walk_length: u16,
+    /// Number of hops a `ForwardJoin` travels before a peer adds the new peer to its passive view.
+    pub passive_random_walk_length: u16,
     /// Number of hops a `Shuffle` message is propagated until a peer replies to it.
-    pub shuffle_random_walk_length: Ttl,
+    pub shuffle_random_walk_length: u16,
     /// Number of active peers to be included in a `Shuffle` request.
     pub shuffle_active_view_count: usize,
     /// Number of passive peers to be included in a `Shuffle` request.
@@ -312,6 +295,23 @@ pub struct Config {
     /// on a slow network. A dial that fails ends the request earlier.
     pub neighbor_request_timeout: Duration,
 }
+impl Config {
+    /// Returns the [`Ttl`] that a `ForwardJoin` starts with.
+    fn active_walk_ttl(&self) -> Ttl {
+        Ttl(self.active_random_walk_length)
+    }
+
+    /// Returns the [`Ttl`] at which a `ForwardJoin` adds the new peer to the passive view.
+    fn passive_walk_ttl(&self) -> Ttl {
+        Ttl(self.passive_random_walk_length)
+    }
+
+    /// Returns the [`Ttl`] that a `Shuffle` starts with.
+    fn shuffle_walk_ttl(&self) -> Ttl {
+        Ttl(self.shuffle_random_walk_length)
+    }
+}
+
 impl Default for Config {
     /// Default values for the HyParView layer
     fn default() -> Self {
@@ -321,11 +321,11 @@ impl Default for Config {
             // From the paper (p9)
             passive_view_capacity: 30,
             // From the paper (p9)
-            active_random_walk_length: Ttl(6),
+            active_random_walk_length: 6,
             // From the paper (p9)
-            passive_random_walk_length: Ttl(3),
+            passive_random_walk_length: 3,
             // From the paper (p9)
-            shuffle_random_walk_length: Ttl(6),
+            shuffle_random_walk_length: 6,
             // From the paper (p9)
             shuffle_active_view_count: 3,
             // From the paper (p9)
@@ -465,10 +465,7 @@ where
         if !self.timers_scheduled {
             self.timers_scheduled = true;
             self.schedule_shuffle(io);
-            io.push(OutEvent::ScheduleTimer(
-                MAINTENANCE_INTERVAL,
-                Timer::DoMaintenance,
-            ));
+            io.schedule(MAINTENANCE_INTERVAL, Timer::DoMaintenance);
         }
 
         #[cfg(test)]
@@ -535,20 +532,17 @@ where
             Message::Neighbor(details) => self.on_neighbor(from, details, io),
             Message::Disconnect(details) => self.on_disconnect(from, details, io),
         }
-
-        // Disconnect from passive nodes right after receiving a message, a
-        // `Disconnect` included.
-        self.release_if_unused(from, io);
     }
 
-    /// Disconnects `peer` unless it is a neighbor or we wait for its `Neighbor` reply.
+    /// Returns whether we want a connection to `peer`.
     ///
-    /// The reply can come on the connection, and a closed connection would lose it.
-    fn release_if_unused(&self, peer: PI, io: &mut impl IO<PI>) {
-        if !self.active_view.contains(&peer) && !self.pending_neighbor_requests.contains_key(&peer)
-        {
-            io.push(OutEvent::DisconnectPeer(peer));
-        }
+    /// That is the case for a neighbor, and for a peer whose reply to our
+    /// `Neighbor` or `Join` we wait for: the reply can come on the connection,
+    /// and a closed connection would lose it. Other peers need no connection.
+    pub(crate) fn wants_connection(&self, peer: &PI) -> bool {
+        self.active_view.contains(peer)
+            || self.pending_neighbor_requests.contains_key(peer)
+            || self.pending_joins.contains_key(peer)
     }
 
     fn handle_join(&mut self, peer: PI, io: &mut impl IO<PI>) {
@@ -572,19 +566,13 @@ where
             let id = self.next_join;
             self.next_join += 1;
             self.pending_joins.insert(peer, id);
-            io.push(OutEvent::ScheduleTimer(
-                JOIN_RETRY_DELAY,
-                Timer::RetryJoin(peer, id),
-            ));
+            io.schedule(JOIN_RETRY_DELAY, Timer::RetryJoin(peer, id));
         }
     }
 
     /// Sends a join to `peer`.
     fn join(&self, peer: PI, io: &mut impl IO<PI>) {
-        io.push(OutEvent::SendMessage(
-            peer,
-            Message::Join(self.me_data.clone()),
-        ));
+        io.send(peer, Message::Join(self.me_data.clone()));
     }
 
     /// We received a disconnect message.
@@ -663,8 +651,7 @@ where
             alive,
             _respond: false,
         });
-        io.push(OutEvent::SendMessage(peer, message));
-        io.push(OutEvent::DisconnectPeer(peer));
+        io.send(peer, message);
     }
 
     fn on_join(&mut self, peer: PI, data: Option<PeerData>, io: &mut impl IO<PI>) {
@@ -689,14 +676,14 @@ where
         // and Passive Random Walk Length (PRWL), that specifies at which point in the walk the node
         // is inserted in a passive view. To use these parameters, the ForwardJoin request carries
         // a “time to live” field that is initially set to ARWL and decreased at every hop. (7)"
-        let ttl = self.config.active_random_walk_length;
+        let ttl = self.config.active_walk_ttl();
         let peer_info = PeerInfo { id: peer, data };
         for node in self.active_view.iter_without(&peer) {
             let message = Message::ForwardJoin(ForwardJoin {
                 peer: peer_info.clone(),
                 ttl,
             });
-            io.push(OutEvent::SendMessage(*node, message));
+            io.send(*node, message);
         }
     }
 
@@ -718,7 +705,7 @@ where
             self.send_neighbor(peer_id, Priority::High, io);
         } else {
             // "ii) If the time to live is equal to PRWL, p will insert the new node into its passive view"
-            if message.ttl == self.config.passive_random_walk_length {
+            if message.ttl == self.config.passive_walk_ttl() {
                 self.add_passive(peer_id, message.peer.data.clone(), io);
             }
             // "iii) The time to live field is decremented."
@@ -738,7 +725,7 @@ where
                             peer: message.peer,
                             ttl: message.ttl.next(),
                         });
-                        io.push(OutEvent::SendMessage(*next, message));
+                        io.send(*next, message);
                     }
                 }
             }
@@ -776,8 +763,8 @@ where
             if self.peer_data.get(&peer_info.id) == Some(&data) {
                 return;
             }
-            if !data.0.is_empty() {
-                io.push(OutEvent::PeerData(peer_info.id, data.clone()));
+            if !data.as_bytes().is_empty() {
+                io.peer_data(peer_info.id, data.clone());
             }
             self.peer_data.insert(peer_info.id, data);
         }
@@ -797,8 +784,6 @@ where
                 self.add_passive(node.id, node.data, io);
             }
             self.send_shuffle_reply(shuffle.origin, len, io);
-            // The origin is usually no neighbor, and the reply its only use.
-            self.release_if_unused(shuffle.origin, io);
         } else if let Some(node) = self
             .active_view
             .pick_random_without(&[&shuffle.origin, &from], &mut self.rng)
@@ -808,7 +793,7 @@ where
                 nodes: shuffle.nodes,
                 ttl: shuffle.ttl.next(),
             });
-            io.push(OutEvent::SendMessage(*node, message));
+            io.send(*node, message);
         }
     }
 
@@ -826,7 +811,7 @@ where
         let message = Message::ShuffleReply(ShuffleReply {
             nodes: nodes.collect(),
         });
-        io.push(OutEvent::SendMessage(to, message));
+        io.send(to, message);
     }
 
     fn on_shuffle_reply(&mut self, from: PI, message: ShuffleReply<PI>, io: &mut impl IO<PI>) {
@@ -876,9 +861,9 @@ where
             let message = Shuffle {
                 origin: self.me,
                 nodes: nodes.collect(),
-                ttl: self.config.shuffle_random_walk_length,
+                ttl: self.config.shuffle_walk_ttl(),
             };
-            io.push(OutEvent::SendMessage(*node, Message::Shuffle(message)));
+            io.send(*node, Message::Shuffle(message));
         }
         self.schedule_shuffle(io);
     }
@@ -945,10 +930,7 @@ where
                 self.refused.clear();
             }
         }
-        io.push(OutEvent::ScheduleTimer(
-            MAINTENANCE_INTERVAL,
-            Timer::DoMaintenance,
-        ));
+        io.schedule(MAINTENANCE_INTERVAL, Timer::DoMaintenance);
     }
 
     /// Schedules the next shuffle, with the interval doubled up to its maximum.
@@ -959,10 +941,7 @@ where
         let interval = self.next_shuffle_interval;
         self.next_shuffle_interval = (interval * 2).min(self.config.shuffle_interval);
         let jitter = self.rng.random_range(0.75..1.25);
-        io.push(OutEvent::ScheduleTimer(
-            interval.mul_f64(jitter),
-            Timer::DoShuffle,
-        ));
+        io.schedule(interval.mul_f64(jitter), Timer::DoShuffle);
     }
 
     /// Returns whether the active view is below half its capacity.
@@ -1100,8 +1079,6 @@ where
             self.pending_neighbor_requests.remove(&peer);
             self.passive_view.remove(&peer);
             self.forget_peer(&peer);
-            // A passive message may have kept the connection for the reply.
-            self.release_if_unused(peer, io);
             self.refill_active_from_passive(&[], io);
         }
     }
@@ -1113,16 +1090,11 @@ where
         io: &mut impl IO<PI>,
     ) -> Option<PI> {
         if let Some(peer) = self.active_view.remove_index(peer_index) {
-            io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
+            io.emit(Event::NeighborDown(peer));
 
-            match reason {
-                // send a disconnect message, then close connection.
-                RemovalReason::Random => self.send_disconnect(peer, true, io),
-                // close connection without sending anything further.
-                RemovalReason::DisconnectReceived { is_alive: _ } => {
-                    io.push(OutEvent::DisconnectPeer(peer))
-                }
-                RemovalReason::ConnectionClosed => io.push(OutEvent::DisconnectPeer(peer)),
+            // Send a disconnect message. After the other reasons, the peer knows already.
+            if matches!(reason, RemovalReason::Random) {
+                self.send_disconnect(peer, true, io);
             }
 
             let keep_as_passive = match reason {
@@ -1158,11 +1130,11 @@ where
         }
     }
 
-    /// Add a peer to the active view.
+    /// Adds a peer to the active view, and returns whether the peer is in it.
     ///
-    /// If the active view is currently full, a random peer will be removed first.
-    /// Sends a Neighbor message to the peer. If high_priority is true, the peer
-    /// may not deny the Neighbor request.
+    /// If the active view is full, a high priority request removes a random
+    /// peer first, and a low priority request fails. Sends a `Neighbor` to the
+    /// peer if `reply` is true.
     fn add_active(
         &mut self,
         peer: PI,
@@ -1209,7 +1181,7 @@ where
         if self.active_view.insert(peer) {
             debug!(other = ?peer, "add to active view");
             self.remember_neighbor(peer);
-            io.push(OutEvent::EmitEvent(Event::NeighborUp(peer)));
+            io.emit(Event::NeighborUp(peer));
             // A recovery goes on, as more neighbors may be missing.
             if self.refill != RefillLimit::Recovery {
                 self.refill = RefillLimit::Automatic;
@@ -1248,11 +1220,11 @@ where
                 priority,
                 data: self.me_data.clone(),
             });
-            io.push(OutEvent::SendMessage(peer, message));
-            io.push(OutEvent::ScheduleTimer(
+            io.send(peer, message);
+            io.schedule(
                 self.config.neighbor_request_timeout,
                 Timer::PendingNeighborRequest(peer, id),
-            ));
+            );
         }
     }
 }
@@ -1304,7 +1276,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
-    use crate::proto::topic::{self, OutEvent as TopicOut};
+    use crate::proto::topic::{self, tests::OutEvent as TopicOut};
 
     type Io = VecDeque<TopicOut<u32>>;
 
@@ -1655,13 +1627,13 @@ mod tests {
             .count()
     }
 
-    /// After a shuffle reply to a non-neighbor, we disconnect it.
+    /// After a shuffle reply to a non-neighbor, we do not want it.
     ///
     /// The reply goes over a connection opened for it. The origin drops us once
     /// it read the reply, but cannot close the connection while our stream is
     /// open.
     #[test]
-    fn shuffle_reply_disconnects_a_non_neighbor() {
+    fn shuffle_reply_wants_no_non_neighbor() {
         let mut state = new_state();
         let io = &mut Io::new();
         state.handle(InEvent::RecvMessage(1, Message::Join(None)), io);
@@ -1671,23 +1643,14 @@ mod tests {
         state.handle(InEvent::RecvMessage(1, Message::test_shuffle(2, 0)), io);
 
         assert_eq!(shuffle_replies_sent(io, 2), 1);
-        let reply_at = io
-            .iter()
-            .position(|event| matches!(event, TopicOut::SendMessage(2, _)))
-            .expect("checked");
-        let disconnect_at = io
-            .iter()
-            .position(|event| matches!(event, TopicOut::DisconnectPeer(2)))
-            .expect("the origin was not disconnected");
-        assert!(reply_at < disconnect_at, "disconnected before the reply");
+        assert!(!state.wants_connection(&2), "the origin is wanted");
         assert!(
-            !io.iter()
-                .any(|event| matches!(event, TopicOut::DisconnectPeer(1))),
-            "the forwarding neighbor was disconnected"
+            state.wants_connection(&1),
+            "the forwarding neighbor is not wanted"
         );
     }
 
-    /// A shuffle reply to a neighbor leaves the neighbor alone.
+    /// A shuffle reply to a neighbor leaves it wanted.
     #[test]
     fn shuffle_reply_keeps_a_neighbor() {
         let mut state = new_state();
@@ -1698,11 +1661,7 @@ mod tests {
         state.handle(InEvent::RecvMessage(1, Message::test_shuffle(1, 0)), io);
 
         assert_eq!(shuffle_replies_sent(io, 1), 1);
-        assert!(
-            !io.iter()
-                .any(|event| matches!(event, TopicOut::DisconnectPeer(1))),
-            "the neighbor was disconnected"
-        );
+        assert!(state.wants_connection(&1), "the neighbor is not wanted");
     }
 
     #[test]
@@ -1864,9 +1823,8 @@ mod tests {
 
         assert!(!has_metadata(&state, 1));
         assert!(
-            io.iter()
-                .any(|event| matches!(event, TopicOut::DisconnectPeer(1))),
-            "the peer that did not answer was kept"
+            !state.wants_connection(&1),
+            "the peer that did not answer is wanted"
         );
     }
 
@@ -1969,19 +1927,12 @@ mod tests {
         assert!(state.pending_neighbor_requests.is_empty());
     }
 
-    /// Returns whether the state asked to close the connection to `peer`.
-    fn disconnected(io: &Io, peer: u32) -> bool {
-        io.iter()
-            .any(|event| matches!(event, TopicOut::DisconnectPeer(p) if *p == peer))
-    }
-
-    /// A `Disconnect` from a peer that is no neighbor closes its connection.
+    /// A `Disconnect` from a peer that is no neighbor leaves it unwanted.
     ///
     /// Two peers that evict each other at once both send one. The second
-    /// arrives from a peer that we dropped already. Without the disconnect,
-    /// the message would leave the peer in use and its connection open.
+    /// arrives from a peer that we dropped already.
     #[test]
-    fn disconnect_from_a_non_neighbor_releases_it() {
+    fn disconnect_from_a_non_neighbor_wants_no_peer() {
         let mut state = new_state();
         let io = &mut Io::new();
         let disconnect = Message::Disconnect(Disconnect {
@@ -1989,11 +1940,12 @@ mod tests {
             _respond: false,
         });
         state.handle(InEvent::RecvMessage(1, disconnect), io);
-        assert!(disconnected(io, 1));
+        assert!(!state.wants_connection(&1));
     }
 
-    /// An unrelated passive reply must not close the connection on which a
-    /// Neighbor acceptance is still due. This is the race discussed in #178.
+    /// An unrelated passive reply keeps a connection that waits for a `Neighbor` acceptance.
+    ///
+    /// This is the race of #178.
     #[test]
     fn passive_reply_keeps_a_pending_neighbor_connection() {
         let mut state = new_state();
@@ -2004,20 +1956,18 @@ mod tests {
             InEvent::RecvMessage(1, Message::ShuffleReply(ShuffleReply { nodes: vec![] })),
             io,
         );
-        assert!(state.pending_neighbor_requests.contains_key(&1));
         assert!(
-            !io.iter()
-                .any(|event| matches!(event, TopicOut::DisconnectPeer(1))),
-            "a passive reply closed the connection before the Neighbor reply"
+            state.wants_connection(&1),
+            "a passive reply dropped the peer before the Neighbor reply"
         );
     }
 
-    /// A request that ends without a neighbor releases the connection it kept.
+    /// A request that ends without a neighbor leaves its peer unwanted.
     ///
-    /// A passive message keeps the connection while the request is out. If the
-    /// reply never comes, the timeout must close it, or it stays open for good.
+    /// A passive message keeps the peer wanted while the request is out. If the
+    /// reply never comes, the timeout must drop it, or the peer stays wanted.
     #[test]
-    fn timed_out_request_releases_its_connection() {
+    fn timed_out_request_leaves_its_peer_unwanted() {
         let mut state = new_state();
         state.passive_view.insert(1);
         state.send_neighbor(1, Priority::High, &mut Io::new());
@@ -2028,7 +1978,7 @@ mod tests {
             InEvent::TimerExpired(Timer::PendingNeighborRequest(1, 0)),
             io,
         );
-        assert!(disconnected(io, 1), "the connection outlived its request");
+        assert!(!state.wants_connection(&1), "the peer outlived its request");
     }
 
     /// An accepted request keeps its connection, also after a passive message came first.
@@ -2047,9 +1997,53 @@ mod tests {
         state.handle(InEvent::RecvMessage(1, accept), io);
         assert!(state.active_view.contains(&1));
         assert!(
-            !disconnected(io, 1),
-            "closed the connection of a new neighbor"
+            state.wants_connection(&1),
+            "dropped the connection of a new neighbor"
         );
+    }
+
+    /// A topic wants a neighbor, and a peer it waits on, but not a passive peer.
+    #[test]
+    fn wants_connection_to_neighbors_and_pending_peers() {
+        let mut state = new_state();
+        let io = &mut Io::new();
+        assert!(!state.wants_connection(&1));
+        // A pending join.
+        state.handle(InEvent::RequestJoin(1), io);
+        assert!(state.wants_connection(&1));
+        // A neighbor.
+        state.handle(InEvent::RecvMessage(1, Message::Join(None)), io);
+        assert!(state.wants_connection(&1));
+        // A passive peer, and a passive peer with a request out.
+        state.passive_view.insert(2);
+        assert!(!state.wants_connection(&2));
+        state.send_neighbor(2, Priority::High, io);
+        assert!(state.wants_connection(&2));
+    }
+
+    /// A peer is no longer wanted once it is gone from the views and the requests.
+    #[test]
+    fn wants_connection_ends_with_the_peer() {
+        let mut state = new_state();
+        let io = &mut Io::new();
+        state.handle(InEvent::RecvMessage(1, Message::Join(None)), io);
+        assert!(state.wants_connection(&1));
+        state.handle(InEvent::PeerDisconnected(1), io);
+        assert!(!state.wants_connection(&1));
+        // A join that the peer answers with a disconnect.
+        state.handle(InEvent::RequestJoin(2), io);
+        assert!(state.wants_connection(&2));
+        state.handle(
+            InEvent::RecvMessage(
+                2,
+                Message::Disconnect(Disconnect {
+                    alive: false,
+                    _respond: false,
+                }),
+            ),
+            io,
+        );
+        assert!(!state.wants_connection(&2));
     }
 
     /// Returns the peers that got a join.
@@ -2142,8 +2136,7 @@ mod tests {
         assert_eq!(Vec::from(state.recent_neighbors.clone()), expected);
     }
 
-    /// A node that loses its last neighbor, with an empty passive view,
-    /// rejoins through the peers the application joined.
+    /// A node without neighbors and passive peers rejoins through its bootstrap peers.
     #[test]
     fn maintenance_rejoins_when_isolated() {
         let mut state = new_state();
@@ -2729,8 +2722,7 @@ mod tests {
         assert!(requested.is_empty(), "asked {requested:?} after a refusal");
     }
 
-    /// The first shuffle comes soon after joining, and the interval backs
-    /// off to the configured one.
+    /// The first shuffle comes soon after a join, and the interval grows to the configured one.
     #[test]
     fn shuffle_interval_backs_off_to_the_configured_one() {
         let mut state = new_state();
