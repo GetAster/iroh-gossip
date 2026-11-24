@@ -480,9 +480,11 @@ pub struct State<PI> {
     /// Whether a [`Timer::AnnounceDropped`] has been scheduled.
     announce_dropped_scheduled: bool,
 
-    /// Whether a [`Timer::EvictCache`] is scheduled. It is armed only while a
-    /// message cache holds entries, so an idle topic sets no timer.
-    evict_timer_scheduled: bool,
+    /// The deadline of the newest [`Timer::EvictCache`] we scheduled, if its
+    /// timer has not fired. It is armed only while a message cache holds
+    /// entries, so an idle topic sets no timer. An earlier deadline supersedes
+    /// it; the timer of the superseded deadline still fires and is harmless.
+    evict_timer_deadline: Option<Instant>,
 
     /// [`Stats`] of this plumtree.
     pub(crate) stats: Stats,
@@ -507,7 +509,7 @@ impl<PI: PeerIdentity> State<PI> {
             dispatch_timer_scheduled: false,
             announce_dropped_scheduled: false,
             cache: TimeBoundCache::with_hasher(FxBuildHasher),
-            evict_timer_scheduled: false,
+            evict_timer_deadline: None,
             stats: Default::default(),
             max_message_size,
         }
@@ -1001,20 +1003,27 @@ impl<PI: PeerIdentity> State<PI> {
     }
 
     fn on_evict_cache_timer(&mut self, now: Instant, _io: &mut impl IO<PI>) {
-        self.evict_timer_scheduled = false;
+        // A timer that an earlier deadline superseded fires after the armed
+        // one: it only evicts what has expired and leaves the armed deadline.
+        if self
+            .evict_timer_deadline
+            .is_none_or(|deadline| deadline <= now)
+        {
+            self.evict_timer_deadline = None;
+        }
         self.cache.expire_until(now);
         self.received_messages.expire_until(now);
         self.grafted.expire_until(now);
     }
 
     /// Arms [`Timer::EvictCache`] for the earliest expiry in any of the caches,
-    /// but no sooner than `cache_evict_interval`, unless one is already armed or
-    /// all caches are empty. Runs after every event, so a cache that gains
-    /// entries always gets a timer and an empty one never keeps a topic awake.
+    /// but no sooner than `cache_evict_interval`, unless a timer is already
+    /// armed for that deadline or an earlier one, or all caches are empty. A
+    /// cache entry that expires before the armed deadline gets a timer of its
+    /// own, and the armed one is superseded. Runs after every event, so a cache
+    /// that gains entries always gets a timer and an empty one never keeps a
+    /// topic awake.
     fn schedule_evict(&mut self, now: Instant, io: &mut impl IO<PI>) {
-        if self.evict_timer_scheduled {
-            return;
-        }
         let Some(next) = [
             self.cache.next_expiry(),
             self.received_messages.next_expiry(),
@@ -1028,7 +1037,14 @@ impl<PI: PeerIdentity> State<PI> {
         let delay = next
             .saturating_duration_since(now)
             .max(self.config.cache_evict_interval);
-        self.evict_timer_scheduled = true;
+        let deadline = now + delay;
+        if self
+            .evict_timer_deadline
+            .is_some_and(|armed| armed <= deadline)
+        {
+            return;
+        }
+        self.evict_timer_deadline = Some(deadline);
         io.schedule(delay, Timer::EvictCache);
     }
 
@@ -2191,7 +2207,10 @@ mod test {
         state.handle(InEvent::TimerExpired(Timer::EvictCache), t61, &mut io);
         // B's payload is gone; the timer re-arms for A's id, at t90.
         assert!(state.cache.is_empty());
-        assert_eq!(evict_delays(&io), vec![t0 + config.message_id_retention - t61]);
+        assert_eq!(
+            evict_delays(&io),
+            vec![t0 + config.message_id_retention - t61]
+        );
 
         // Both timers for t90 fire. The first evicts A's id and re-arms for B's
         // id, at t121; the second finds that armed timer and arms nothing.
@@ -2225,14 +2244,20 @@ mod test {
         let io = recv_payload(&mut state, b"A", t0);
         assert_eq!(evict_delays(&io).len(), 1);
         let io = recv_payload(&mut state, b"B", t0 + Duration::from_secs(2));
-        assert!(evict_delays(&io).is_empty(), "B expires later than the armed timer");
+        assert!(
+            evict_delays(&io).is_empty(),
+            "B expires later than the armed timer"
+        );
         let mut io = VecDeque::new();
         state.handle(
             InEvent::TimerExpired(Timer::DispatchLazyPush),
             t0 + Duration::from_secs(3),
             &mut io,
         );
-        assert!(evict_delays(&io).is_empty(), "an unrelated input arms nothing");
+        assert!(
+            evict_delays(&io).is_empty(),
+            "an unrelated input arms nothing"
+        );
     }
 
     /// A cache that holds only a graft record (no payload, no message id) arms
@@ -2246,7 +2271,10 @@ mod test {
         state.on_neighbor_up(2);
         let mut io = VecDeque::new();
         state.handle(InEvent::RecvMessage(2, ihave(id, 1)), now, &mut io);
-        assert!(evict_delays(&io).is_empty(), "an announcement caches nothing");
+        assert!(
+            evict_delays(&io).is_empty(),
+            "an announcement caches nothing"
+        );
 
         let mut io = VecDeque::new();
         state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
