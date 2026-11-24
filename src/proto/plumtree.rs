@@ -2098,6 +2098,191 @@ mod test {
         );
     }
 
+    /// The delays of the [`Timer::EvictCache`] timers in `io`.
+    fn evict_delays(io: &VecDeque<topic::tests::OutEvent<u32>>) -> Vec<Duration> {
+        io.iter()
+            .filter_map(|event| match event {
+                topic::tests::OutEvent::ScheduleTimer(
+                    delay,
+                    topic::Timer::Gossip(Timer::EvictCache),
+                ) => Some(*delay),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Receives a payload from peer 2 at `now`.
+    fn recv_payload(
+        state: &mut State<u32>,
+        content: &'static [u8],
+        now: Instant,
+    ) -> VecDeque<topic::tests::OutEvent<u32>> {
+        let content: Bytes = content.to_vec().into();
+        let message = Message::Gossip(Gossip {
+            id: MessageId::from_content(&content),
+            content,
+            scope: DeliveryScope::Swarm(Round(1)),
+        });
+        let mut io = VecDeque::new();
+        state.handle(InEvent::RecvMessage(2, message), now, &mut io);
+        io
+    }
+
+    /// A message cached after the eviction timer moved out to a later expiry
+    /// must still be evicted at its own, earlier expiry (ledger row 83: the
+    /// timer is armed "for the earliest expiry").
+    ///
+    /// A is cached at t0: its payload expires at t30, its id at t90. When the
+    /// timer fires at t30 it re-arms for t90. B arrives at t31 and its payload
+    /// expires at t61, so a timer for t61 is needed; with the timer left at t90
+    /// B's payload would be served and held for 29 s too long.
+    #[test]
+    fn earlier_expiry_supersedes_the_armed_eviction_timer() {
+        let config: Config = Default::default();
+        let mut state = State::new(1, config.clone(), 1024);
+        let t0 = Instant::now();
+        let io = recv_payload(&mut state, b"A", t0);
+        assert_eq!(evict_delays(&io), vec![config.message_cache_retention]);
+
+        // At t30 A's payload expires and the timer moves to A's id, at t90.
+        let t30 = t0 + config.message_cache_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t30, &mut io);
+        assert_eq!(
+            evict_delays(&io),
+            vec![config.message_id_retention - config.message_cache_retention]
+        );
+
+        // B arrives at t31, with its payload expiring at t61, before t90.
+        let t31 = t30 + Duration::from_secs(1);
+        let io = recv_payload(&mut state, b"B", t31);
+        assert_eq!(
+            evict_delays(&io),
+            vec![config.message_cache_retention],
+            "B's earlier expiry arms a timer for t61"
+        );
+
+        // That timer fires at t61 and evicts B's payload.
+        let t61 = t31 + config.message_cache_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t61, &mut io);
+        assert!(state.cache.is_empty(), "B's payload is evicted at t61");
+    }
+
+    /// The timer that an earlier one superseded still fires. It evicts what has
+    /// expired and neither clears nor doubles the armed timer.
+    #[test]
+    fn superseded_eviction_timer_is_harmless() {
+        let config: Config = Default::default();
+        let mut state = State::new(1, config.clone(), 1024);
+        let t0 = Instant::now();
+        recv_payload(&mut state, b"A", t0);
+        let t30 = t0 + config.message_cache_retention;
+        state.handle(
+            InEvent::TimerExpired(Timer::EvictCache),
+            t30,
+            &mut VecDeque::new(),
+        );
+        // The timer for t90 is now stale, once B moves the deadline to t61.
+        let t31 = t30 + Duration::from_secs(1);
+        recv_payload(&mut state, b"B", t31);
+        let t61 = t31 + config.message_cache_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t61, &mut io);
+        // B's payload is gone; the timer re-arms for A's id, at t90.
+        assert!(state.cache.is_empty());
+        assert_eq!(evict_delays(&io), vec![t0 + config.message_id_retention - t61]);
+
+        // Both timers for t90 fire. The first evicts A's id and re-arms for B's
+        // id, at t121; the second finds that armed timer and arms nothing.
+        let t90 = t0 + config.message_id_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t90, &mut io);
+        assert_eq!(
+            evict_delays(&io),
+            vec![t31 + config.message_id_retention - t90]
+        );
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t90, &mut io);
+        assert!(evict_delays(&io).is_empty(), "the stale timer arms nothing");
+        assert_eq!(state.received_messages.len(), 1, "B's id is still held");
+
+        // The armed timer still runs and drains the last entry.
+        let t121 = t31 + config.message_id_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t121, &mut io);
+        assert!(state.received_messages.is_empty());
+        assert!(evict_delays(&io).is_empty());
+    }
+
+    /// A second input while a timer is armed for the same or an earlier expiry
+    /// arms no second timer.
+    #[test]
+    fn second_input_does_not_double_arm_the_eviction_timer() {
+        let config: Config = Default::default();
+        let mut state = State::new(1, config.clone(), 1024);
+        let t0 = Instant::now();
+        let io = recv_payload(&mut state, b"A", t0);
+        assert_eq!(evict_delays(&io).len(), 1);
+        let io = recv_payload(&mut state, b"B", t0 + Duration::from_secs(2));
+        assert!(evict_delays(&io).is_empty(), "B expires later than the armed timer");
+        let mut io = VecDeque::new();
+        state.handle(
+            InEvent::TimerExpired(Timer::DispatchLazyPush),
+            t0 + Duration::from_secs(3),
+            &mut io,
+        );
+        assert!(evict_delays(&io).is_empty(), "an unrelated input arms nothing");
+    }
+
+    /// A cache that holds only a graft record (no payload, no message id) arms
+    /// the timer for the graft's expiry, and the timer drains it.
+    #[test]
+    fn graft_only_cache_arms_and_drains_the_eviction_timer() {
+        let config: Config = Default::default();
+        let mut state = State::new(1u32, config.clone(), 1024);
+        let now = Instant::now();
+        let id = MessageId::from_content(b"missing");
+        state.on_neighbor_up(2);
+        let mut io = VecDeque::new();
+        state.handle(InEvent::RecvMessage(2, ihave(id, 1)), now, &mut io);
+        assert!(evict_delays(&io).is_empty(), "an announcement caches nothing");
+
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::SendGraft(id)), now, &mut io);
+        assert!(state.cache.is_empty() && state.received_messages.is_empty());
+        assert_eq!(state.grafted.len(), 1);
+        assert_eq!(
+            evict_delays(&io),
+            vec![config.message_cache_retention],
+            "the graft record arms the timer"
+        );
+
+        let at = now + config.message_cache_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), at, &mut io);
+        assert!(state.grafted.is_empty());
+        assert!(evict_delays(&io).is_empty(), "drained: no timer");
+    }
+
+    /// After a complete drain the next cached message arms the timer again.
+    #[test]
+    fn eviction_timer_restarts_after_a_complete_drain() {
+        let config: Config = Default::default();
+        let mut state = State::new(1, config.clone(), 1024);
+        let t0 = Instant::now();
+        recv_payload(&mut state, b"A", t0);
+        let t90 = t0 + config.message_id_retention;
+        let mut io = VecDeque::new();
+        state.handle(InEvent::TimerExpired(Timer::EvictCache), t90, &mut io);
+        assert!(state.cache.is_empty() && state.received_messages.is_empty());
+        assert!(evict_delays(&io).is_empty());
+
+        let later = t90 + Duration::from_secs(500);
+        let io = recv_payload(&mut state, b"C", later);
+        assert_eq!(evict_delays(&io), vec![config.message_cache_retention]);
+    }
+
     #[test]
     fn cache_is_evicted() {
         let config: Config = Default::default();
